@@ -2,13 +2,15 @@
 #include <fstream>
 #include <string>
 #include <chrono>
-
 #include "ChiungEngine.h"
 #include "TeammateEngine.h"
 
 using namespace std;
 using namespace std::chrono;
 
+// =====================================================================
+// [보드판 상태 변환 어댑터]
+// =====================================================================
 Teammate::Bitboard convertToTeammateBoard(const Chiung::Bitboard& cb) {
     Teammate::Bitboard tb;
     tb.p1 = cb.p1;
@@ -22,6 +24,9 @@ Teammate::Bitboard convertToTeammateBoard(const Chiung::Bitboard& cb) {
     return tb;
 }
 
+// =====================================================================
+// [메인 함수: 100판 무음(Silent) 초고속 시뮬레이션]
+// =====================================================================
 int main() {
     Chiung::AtaxxEngine::initMasks();
     Teammate::initEngine();
@@ -38,7 +43,7 @@ int main() {
     int gameID = 1;
 
     // 판수 설정 부분 
-    const int ITERATIONS = 1;
+    const int ITERATIONS = 100;
     // 판수 설정 부분
     const double TIME_LIMIT = 1.0; // 턴당 제한시간 1초
 
@@ -58,6 +63,10 @@ int main() {
         int turns = 0;
         double lowest_p1_percent = 100.0;
 
+        // [수정 포인트 1] 매 턴 지워지는 엔진 내부 카운트 대신 게임 단위 누적용 변수 신설
+        long long p1TotalNodesAccum = 0;
+        long long p2TotalNodesAccum = 0;
+
         while (!board.isGameOver() && turns < 200) {
             int p1Count = Chiung::popcount64(board.p1);
             int totalCount = p1Count + Chiung::popcount64(board.p2);
@@ -70,11 +79,12 @@ int main() {
 
             if (currColor == Chiung::PLAYER1) {
                 auto start = high_resolution_clock::now();
-                // 치웅 엔진 1.0초 멀티스레드 탐색
                 Chiung::Move bestMove = Chiung::AtaxxEngine::getBestMoveTimeLimited(board, Chiung::PLAYER1, TIME_LIMIT);
                 auto end = high_resolution_clock::now();
 
                 p1TotalTimeMs += duration<double, std::milli>(end - start).count();
+                // [수정 포인트 2] 턴 종료 직후 해당 턴에서 탐색한 원자적 노드 수를 안전하게 합산
+                p1TotalNodesAccum += Chiung::AtaxxEngine::totalGameNodes.load();
                 p1MovesCount++;
 
                 if (bestMove.to != -1) {
@@ -85,11 +95,12 @@ int main() {
                 Teammate::Bitboard tBoard = convertToTeammateBoard(board);
 
                 auto start = high_resolution_clock::now();
-                // [핵심 변경] 팀원 엔진도 1.0초 멀티스레드 탐색 적용
                 Teammate::Move tmMove = Teammate::AtaxxEngine::getBestMoveTimeLimited(tBoard, Teammate::PLAYER2, TIME_LIMIT, 1, 2, 3);
                 auto end = high_resolution_clock::now();
 
                 p2TotalTimeMs += duration<double, std::milli>(end - start).count();
+                // [수정 포인트 3] 팀원 엔진의 원자적 노드 수도 덮어써지기 전에 즉시 누적
+                p2TotalNodesAccum += Teammate::AtaxxEngine::totalNodes.load();
                 p2MovesCount++;
 
                 if (tmMove.to != -1) {
@@ -107,16 +118,19 @@ int main() {
 
         double p1AvgTime = (p1MovesCount > 0) ? (p1TotalTimeMs / p1MovesCount) : 0.0;
         double p2AvgTime = (p2MovesCount > 0) ? (p2TotalTimeMs / p2MovesCount) : 0.0;
-        long long p1Nps = (p1TotalTimeMs > 0) ? (long long)(Chiung::AtaxxEngine::totalGameNodes / (p1TotalTimeMs / 1000.0)) : 0;
-        long long p2Nps = (p2TotalTimeMs > 0) ? (long long)(Teammate::AtaxxEngine::totalNodes / (p2TotalTimeMs / 1000.0)) : 0;
+
+        // [수정 포인트 4] 게임 총 연산 노드를 총 소요 시간으로 나누어 정확한 물리 NPS 연산 확립
+        long long p1Nps = (p1TotalTimeMs > 0) ? (long long)(p1TotalNodesAccum / (p1TotalTimeMs / 1000.0)) : 0;
+        long long p2Nps = (p2TotalTimeMs > 0) ? (long long)(p2TotalNodesAccum / (p2TotalTimeMs / 1000.0)) : 0;
 
         csv << gameID++ << "," << TIME_LIMIT << "," << winner << "," << lowest_p1_percent << ","
             << p1AvgTime << "," << p2AvgTime << "," << p1Nps << "," << p2Nps << "," << turns << "\n";
 
-        cout << "  -> " << iter << "판 완료... (현재 치웅 승: " << p1Wins << ")\n";
+        // [수정 포인트 5] 두 줄로 나뉘어 출력 카운트가 흐트러지던 가독성 오류를 한 줄의 직관적인 스코어보드로 대개조
+        cout << "  -> " << iter << "판 완료... [실시간 스코어] 치웅(P1): " << p1Wins << "승 | 태완(P2): " << p2Wins << "승 | 무승부: " << draws << "\n";
     }
 
-    cout << "🔥 제한시간 " << TIME_LIMIT << "초 공정 대결 최종 결과 | 치웅 승: " << p1Wins << " / 팀원 승: " << p2Wins << " / 무승부: " << draws << "\n\n";
+    cout << "\n🔥 제한시간 " << TIME_LIMIT << "초 공정 대결 최종 결과 | 치웅 승: " << p1Wins << " / 팀원 승: " << p2Wins << " / 무승부: " << draws << "\n\n";
 
     csv.close();
     cout << "✅ 시뮬레이션 끝! 모든 지표가 'Algorithm_Metrics_FairFight.csv' 파일에 저장되었습니다.\n";
