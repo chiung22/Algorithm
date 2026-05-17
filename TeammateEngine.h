@@ -10,574 +10,323 @@
 #include <mutex>
 #include <atomic>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 using namespace std;
 using namespace std::chrono;
 
-const int SIZE = 7;
-const int CELL_COUNT = 49;
-const uint64_t FULL_BOARD_MASK = (1ULL << 49) - 1;
+namespace Teammate {
 
-const int PLAYER1 = 1;
-const int PLAYER2 = 2;
-
-const int INF = 1000000;
-const int TT_SIZE = 1048576;
-const double TIME_LIMIT_SECONDS = 2.0;
-const int THREAD_COUNT = 4;
-
-inline int popcount64(uint64_t x) {
-    return (int)bitset<64>(x).count();
-}
-
-inline int ctz64(uint64_t x) {
-    int count = 0;
-    while ((x & 1ULL) == 0) {
-        x >>= 1;
-        count++;
-    }
-    return count;
-}
-
-uint64_t ADJ_MASK[49];
-uint64_t JUMP_MASK[49];
-uint64_t ZOBRIST[49][2];
-uint64_t ZOBRIST_TURN;
-
-struct Move {
-    int from;
-    int to;
-    bool isClone;
-    int infectCount;
-    int orderScore;
-
-    bool operator<(const Move& other) const {
-        return orderScore > other.orderScore;
-    }
-};
-
-struct Bitboard {
-    uint64_t p1 = 0;
-    uint64_t p2 = 0;
-    uint64_t hashKey = 0;
-
-    void init() {
-        p1 = 0;
-        p2 = 0;
-        hashKey = 0;
-
-        p1 |= (1ULL << 0);
-        p1 |= (1ULL << 48);
-
-        p2 |= (1ULL << 6);
-        p2 |= (1ULL << 42);
-
-        hashKey ^= ZOBRIST[0][0];
-        hashKey ^= ZOBRIST[48][0];
-        hashKey ^= ZOBRIST[6][1];
-        hashKey ^= ZOBRIST[42][1];
-        hashKey ^= ZOBRIST_TURN;
+    inline int popcount64(uint64_t x) {
+#ifdef _MSC_VER
+        return (int)__popcnt64(x);
+#else
+        return (int)__builtin_popcountll(x);
+#endif
     }
 
-    bool isGameOver() const {
-        uint64_t empty = ~(p1 | p2) & FULL_BOARD_MASK;
-        return empty == 0 || p1 == 0 || p2 == 0;
-    }
-};
-
-enum TTFlag {
-    EXACT,
-    LOWERBOUND,
-    UPPERBOUND
-};
-
-struct TTEntry {
-    uint64_t hash = 0;
-    int depth = -1;
-    int value = 0;
-    TTFlag flag = EXACT;
-};
-
-vector<TTEntry> TT(TT_SIZE);
-mutex ttMutex;
-
-class GPTAI {
-public:
-    static atomic<long long> totalNodes;
-    static atomic<long long> ttHits;
-    static atomic<long long> ttLookups;
-
-    static time_point<steady_clock> searchStartTime;
-    static atomic<bool> timeOver;
-    static int reachedDepth;
-
-    static void checkTime() {
-        double elapsed =
-            duration<double>(steady_clock::now() - searchStartTime).count();
-
-        if (elapsed >= TIME_LIMIT_SECONDS) {
-            timeOver = true;
-        }
+    inline int ctz64(uint64_t x) {
+#ifdef _MSC_VER
+        unsigned long index;
+        _BitScanForward64(&index, x);
+        return (int)index;
+#else
+        return (int)__builtin_ctzll(x);
+#endif
     }
 
-    static int opponent(int color) {
-        return color == PLAYER1 ? PLAYER2 : PLAYER1;
-    }
+    const int SIZE = 7;
+    const int CELL_COUNT = 49;
+    const uint64_t FULL_BOARD_MASK = (1ULL << 49) - 1;
 
-    static int mobilityScore(const Bitboard& b, int color) {
-        uint64_t my = color == PLAYER1 ? b.p1 : b.p2;
-        uint64_t empty = ~(b.p1 | b.p2) & FULL_BOARD_MASK;
+    const int PLAYER1 = 1;
+    const int PLAYER2 = 2;
 
-        int score = 0;
-        uint64_t temp = my;
+    const int INF = 1000000;
+    const int TT_SIZE = 1048576;
 
-        while (temp) {
-            int idx = ctz64(temp);
-            score += popcount64((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty);
-            temp &= temp - 1;
+    inline static uint64_t ADJ_MASK[49];
+    inline static uint64_t JUMP_MASK[49];
+    inline static uint64_t ZOBRIST_TABLE[49][2];
+    inline static uint64_t ZOBRIST_TURN;
+
+    enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
+    struct TTEntry { uint64_t hash = 0; int depth = -1; int flag = EXACT; int value = 0; };
+
+    inline static vector<TTEntry> TT_Cache(TT_SIZE);
+    inline static mutex ttMutex;
+
+    // [치웅 엔진과 동일한 조건] 멀티스레드 제어용 원자적 변수 추가
+    inline static atomic<bool> searchCancelled{ false };
+
+    struct Move {
+        int from, to; bool isClone; int infectCount; int orderScore;
+        bool operator<(const Move& other) const { return orderScore > other.orderScore; }
+        bool operator==(const Move& other) const { return from == other.from && to == other.to && isClone == other.isClone; }
+    };
+
+    struct Bitboard {
+        uint64_t p1 = 0, p2 = 0, hashKey = 0;
+        void init() {
+            p1 = 0; p2 = 0; hashKey = 0;
+            p1 |= (1ULL << 0); p1 |= (1ULL << 48);
+            p2 |= (1ULL << 6); p2 |= (1ULL << 42);
+            hashKey ^= ZOBRIST_TABLE[0][0]; hashKey ^= ZOBRIST_TABLE[48][0];
+            hashKey ^= ZOBRIST_TABLE[6][1]; hashKey ^= ZOBRIST_TABLE[42][1];
+            hashKey ^= ZOBRIST_TURN;
         }
-
-        return score;
-    }
-
-    static int densityScore(uint64_t stones) {
-        int score = 0;
-        uint64_t temp = stones;
-
-        while (temp) {
-            int idx = ctz64(temp);
-            score += popcount64(ADJ_MASK[idx] & stones);
-            temp &= temp - 1;
+        bool isGameOver() const {
+            uint64_t empty = ~(p1 | p2) & FULL_BOARD_MASK;
+            return (empty == 0 || p1 == 0 || p2 == 0);
         }
+    };
 
-        return score;
-    }
+    class AtaxxEngine {
+    public:
+        inline static atomic<long long> totalNodes{ 0 };
+        inline static atomic<long long> ttHits{ 0 };
+        inline static atomic<long long> ttLookups{ 0 };
 
-    static int evaluate(const Bitboard& b, int myColor) {
-        uint64_t my = myColor == PLAYER1 ? b.p1 : b.p2;
-        uint64_t opp = myColor == PLAYER1 ? b.p2 : b.p1;
+        // [치웅 엔진과 동일한 조건] 최고 기록 저장소
+        inline static Move bestMoveOverall;
+        inline static int highestReachedDepth = 0;
+        inline static mutex bestMoveMutex;
 
-        int myCount = popcount64(my);
-        int oppCount = popcount64(opp);
-        int total = myCount + oppCount;
+        static int evaluate(const Bitboard& b, int myColor, int strat_dis, int strat_even, int strat_adv) {
+            uint64_t my = myColor == PLAYER1 ? b.p1 : b.p2;
+            uint64_t opp = myColor == PLAYER1 ? b.p2 : b.p1;
 
-        if (oppCount == 0) return INF;
-        if (myCount == 0) return -INF;
-        if (total == 0) return 0;
+            int myCount = popcount64(my); int oppCount = popcount64(opp);
+            int total = myCount + oppCount;
 
-        double myPercent = ((double)myCount / total) * 100.0;
+            if (oppCount == 0) return INF;
+            if (myCount == 0) return -INF;
+            if (total == 0) return 0;
 
-        int pieceScore = myCount - oppCount;
+            double myPercent = ((double)myCount / total) * 100.0;
+            int pieceScore = myCount - oppCount;
+            int mobilityScore = 0, densityScore = 0;
+            uint64_t temp = my; uint64_t empty = ~(b.p1 | b.p2) & FULL_BOARD_MASK;
 
-        int mobility = mobilityScore(b, myColor);
-        int oppMobility = mobilityScore(b, opponent(myColor));
-        int mobilityDiff = mobility - oppMobility;
-
-        int density = densityScore(my);
-        int oppDensity = densityScore(opp);
-        int densityDiff = density - oppDensity;
-
-        if (myPercent < 45.0) {
-            return pieceScore * 10 + densityDiff * 70 + mobilityDiff * 20;
-        }
-        else if (myPercent <= 55.0) {
-            return pieceScore * 20 + mobilityDiff * 90 + densityDiff * 10;
-        }
-        else {
-            return pieceScore * 120 + mobilityDiff * 20;
-        }
-    }
-
-    static int minimax(
-        const Bitboard& b,
-        int depth,
-        int alpha,
-        int beta,
-        bool isMax,
-        int myColor
-    ) {
-        totalNodes++;
-
-        if ((totalNodes.load() & 2047) == 0) {
-            checkTime();
-
-            if (timeOver) {
-                return evaluate(b, myColor);
-            }
-        }
-
-        int alphaOrig = alpha;
-        int betaOrig = beta;
-
-        int ttIndex = b.hashKey & (TT_SIZE - 1);
-
-        {
-            lock_guard<mutex> lock(ttMutex);
-
-            TTEntry& tte = TT[ttIndex];
-
-            ttLookups++;
-
-            if (tte.hash == b.hashKey && tte.depth >= depth) {
-                ttHits++;
-
-                if (tte.flag == EXACT)
-                    return tte.value;
-
-                if (tte.flag == LOWERBOUND)
-                    alpha = max(alpha, tte.value);
-
-                if (tte.flag == UPPERBOUND)
-                    beta = min(beta, tte.value);
-
-                if (alpha >= beta)
-                    return tte.value;
-            }
-        }
-
-        if (depth == 0 || b.isGameOver()) {
-            return evaluate(b, myColor);
-        }
-
-        int currColor = isMax ? myColor : opponent(myColor);
-        vector<Move> moves = getValidMoves(b, currColor);
-
-        if (moves.empty()) {
-            return evaluate(b, myColor);
-        }
-
-        int best = isMax ? -INF : INF;
-
-        for (auto& m : moves) {
-            if (timeOver)
-                break;
-
-            Bitboard nextB = applyMove(b, m, currColor);
-
-            int val = minimax(
-                nextB,
-                depth - 1,
-                alpha,
-                beta,
-                !isMax,
-                myColor
-            );
-
-            if (isMax) {
-                best = max(best, val);
-                alpha = max(alpha, best);
-            }
-            else {
-                best = min(best, val);
-                beta = min(beta, best);
+            while (temp) {
+                int idx = ctz64(temp);
+                densityScore += popcount64(ADJ_MASK[idx] & my);
+                mobilityScore += popcount64((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty);
+                temp &= temp - 1;
             }
 
-            if (beta <= alpha)
-                break;
+            int currentStrategy = strat_even;
+            if (myPercent < 45.0) currentStrategy = strat_dis;
+            else if (myPercent > 55.0) currentStrategy = strat_adv;
+
+            if (currentStrategy == 1) return pieceScore * 10 + densityScore * 60;
+            else if (currentStrategy == 2) return pieceScore * 20 + mobilityScore * 80;
+            else return pieceScore * 100;
         }
 
-        if (!timeOver) {
-            lock_guard<mutex> lock(ttMutex);
+        static int minimax(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor, int strat_dis, int strat_even, int strat_adv) {
+            // [치웅 엔진과 동일한 조건] 시간 종료 시 즉각 연산 중단
+            if (searchCancelled) return 0;
 
-            TTEntry& tte = TT[ttIndex];
+            totalNodes.fetch_add(1, memory_order_relaxed);
+            int alphaOrig = alpha, betaOrig = beta;
+            int ttIndex = (int)(b.hashKey & (TT_SIZE - 1));
 
-            tte.hash = b.hashKey;
-            tte.depth = depth;
-            tte.value = best;
+            {
+                lock_guard<mutex> lock(ttMutex);
+                TTEntry& tte = TT_Cache[ttIndex];
+                ttLookups.fetch_add(1, memory_order_relaxed);
 
-            if (best <= alphaOrig)
-                tte.flag = UPPERBOUND;
-            else if (best >= betaOrig)
-                tte.flag = LOWERBOUND;
-            else
-                tte.flag = EXACT;
-        }
-
-        return best;
-    }
-
-    static vector<Move> getValidMoves(const Bitboard& b, int color) {
-        vector<Move> moves;
-
-        uint64_t my = color == PLAYER1 ? b.p1 : b.p2;
-        uint64_t opp = color == PLAYER1 ? b.p2 : b.p1;
-        uint64_t empty = ~(b.p1 | b.p2) & FULL_BOARD_MASK;
-
-        uint64_t temp = my;
-
-        while (temp) {
-            int from = ctz64(temp);
-            uint64_t clones = ADJ_MASK[from] & empty;
-
-            while (clones) {
-                int to = ctz64(clones);
-                int caps = popcount64(ADJ_MASK[to] & opp);
-
-                moves.push_back({
-                    from,
-                    to,
-                    true,
-                    caps,
-                    caps * 100 + 10
-                    });
-
-                clones &= clones - 1;
-            }
-
-            temp &= temp - 1;
-        }
-
-        temp = my;
-
-        while (temp) {
-            int from = ctz64(temp);
-            uint64_t jumps = JUMP_MASK[from] & empty;
-
-            while (jumps) {
-                int to = ctz64(jumps);
-                int caps = popcount64(ADJ_MASK[to] & opp);
-
-                moves.push_back({
-                    from,
-                    to,
-                    false,
-                    caps,
-                    caps * 100
-                    });
-
-                jumps &= jumps - 1;
-            }
-
-            temp &= temp - 1;
-        }
-
-        sort(moves.begin(), moves.end());
-        return moves;
-    }
-
-    static Bitboard applyMove(Bitboard b, Move m, int color) {
-        uint64_t* my = color == PLAYER1 ? &b.p1 : &b.p2;
-        uint64_t* opp = color == PLAYER1 ? &b.p2 : &b.p1;
-
-        int myIdx = color == PLAYER1 ? 0 : 1;
-        int oppIdx = color == PLAYER1 ? 1 : 0;
-
-        if (!m.isClone) {
-            *my &= ~(1ULL << m.from);
-            b.hashKey ^= ZOBRIST[m.from][myIdx];
-        }
-
-        *my |= (1ULL << m.to);
-        b.hashKey ^= ZOBRIST[m.to][myIdx];
-
-        uint64_t captured = ADJ_MASK[m.to] & (*opp);
-
-        *my |= captured;
-        *opp &= ~captured;
-
-        uint64_t temp = captured;
-
-        while (temp) {
-            int idx = ctz64(temp);
-
-            b.hashKey ^= ZOBRIST[idx][oppIdx];
-            b.hashKey ^= ZOBRIST[idx][myIdx];
-
-            temp &= temp - 1;
-        }
-
-        b.hashKey ^= ZOBRIST_TURN;
-
-        return b;
-    }
-
-    static Move getBestMove(const Bitboard& board, int myColor) {
-        searchStartTime = steady_clock::now();
-        timeOver = false;
-        reachedDepth = 0;
-
-        vector<Move> moves = getValidMoves(board, myColor);
-
-        if (moves.empty()) {
-            return { -1, -1, false, 0, 0 };
-        }
-
-        Move globalBestMove = moves[0];
-
-        for (int currentDepth = 1; currentDepth <= 64; currentDepth++) {
-            if (timeOver)
-                break;
-
-            Move depthBestMove = globalBestMove;
-            int bestScore = -INF;
-
-            auto it = find_if(
-                moves.begin(),
-                moves.end(),
-                [&](const Move& m) {
-                    return m.from == globalBestMove.from &&
-                        m.to == globalBestMove.to &&
-                        m.isClone == globalBestMove.isClone;
+                if (tte.hash == b.hashKey && tte.depth >= depth) {
+                    ttHits.fetch_add(1, memory_order_relaxed);
+                    if (tte.flag == EXACT) return tte.value;
+                    if (tte.flag == LOWERBOUND) alpha = max(alpha, tte.value);
+                    if (tte.flag == UPPERBOUND) beta = min(beta, tte.value);
+                    if (alpha >= beta) return tte.value;
                 }
-            );
-
-            if (it != moves.end() && it != moves.begin()) {
-                iter_swap(moves.begin(), it);
             }
 
-            mutex bestMutex;
-            atomic<int> nextIndex(0);
+            if (depth == 0 || b.isGameOver()) return evaluate(b, myColor, strat_dis, strat_even, strat_adv);
+
+            int currColor = isMax ? myColor : (myColor == PLAYER1 ? PLAYER2 : PLAYER1);
+            vector<Move> moves = getValidMoves(b, currColor);
+            if (moves.empty()) return evaluate(b, myColor, strat_dis, strat_even, strat_adv);
+
+            int best = isMax ? -INF : INF;
+
+            for (auto& m : moves) {
+                Bitboard nextB = applyMove(b, m, currColor);
+                int val = minimax(nextB, depth - 1, alpha, beta, !isMax, myColor, strat_dis, strat_even, strat_adv);
+
+                if (searchCancelled) return 0;
+
+                if (isMax) { best = max(best, val); alpha = max(alpha, best); }
+                else { best = min(best, val); beta = min(beta, best); }
+                if (beta <= alpha) break;
+            }
+
+            if (!searchCancelled) {
+                lock_guard<mutex> lock(ttMutex);
+                TTEntry& tte = TT_Cache[ttIndex];
+                tte.hash = b.hashKey; tte.depth = depth; tte.value = best;
+                if (best <= alphaOrig) tte.flag = UPPERBOUND;
+                else if (best >= betaOrig) tte.flag = LOWERBOUND;
+                else tte.flag = EXACT;
+            }
+            return best;
+        }
+
+        static vector<Move> getValidMoves(const Bitboard& b, int color) {
+            vector<Move> moves;
+            uint64_t my = color == PLAYER1 ? b.p1 : b.p2;
+            uint64_t opp = color == PLAYER1 ? b.p2 : b.p1;
+            uint64_t empty = ~(b.p1 | b.p2) & FULL_BOARD_MASK;
+
+            uint64_t temp = my;
+            while (temp) {
+                int from = ctz64(temp);
+                uint64_t clones = ADJ_MASK[from] & empty;
+                while (clones) {
+                    int to = ctz64(clones);
+                    int caps = popcount64(ADJ_MASK[to] & opp);
+                    moves.push_back({ from, to, true, caps, caps * 100 + 10 });
+                    clones &= clones - 1;
+                }
+                temp &= temp - 1;
+            }
+
+            temp = my;
+            while (temp) {
+                int from = ctz64(temp);
+                uint64_t jumps = JUMP_MASK[from] & empty;
+                while (jumps) {
+                    int to = ctz64(jumps);
+                    int caps = popcount64(ADJ_MASK[to] & opp);
+                    moves.push_back({ from, to, false, caps, caps * 100 });
+                    jumps &= jumps - 1;
+                }
+                temp &= temp - 1;
+            }
+            sort(moves.begin(), moves.end());
+            return moves;
+        }
+
+        static Bitboard applyMove(Bitboard b, Move m, int color) {
+            uint64_t* my = color == PLAYER1 ? &b.p1 : &b.p2;
+            uint64_t* opp = color == PLAYER1 ? &b.p2 : &b.p1;
+            int myIdx = color == PLAYER1 ? 0 : 1;
+            int oppIdx = color == PLAYER1 ? 1 : 0;
+
+            if (!m.isClone) { *my &= ~(1ULL << m.from); b.hashKey ^= ZOBRIST_TABLE[m.from][myIdx]; }
+            *my |= (1ULL << m.to); b.hashKey ^= ZOBRIST_TABLE[m.to][myIdx];
+
+            uint64_t captured = ADJ_MASK[m.to] & (*opp);
+            *my |= captured; *opp &= ~captured;
+
+            uint64_t temp = captured;
+            while (temp) {
+                int idx = ctz64(temp);
+                b.hashKey ^= ZOBRIST_TABLE[idx][oppIdx]; b.hashKey ^= ZOBRIST_TABLE[idx][myIdx];
+                temp &= temp - 1;
+            }
+            b.hashKey ^= ZOBRIST_TURN;
+            return b;
+        }
+
+        // =========================================================================
+        // 🔥 [치웅 엔진과 동일한 조건] Lazy SMP 멀티스레드 + 시간제한 + 무한 뎁스
+        // =========================================================================
+        static Move getBestMoveTimeLimited(const Bitboard& b, int myColor, double timeLimitSeconds, int strat_dis, int strat_even, int strat_adv) {
+            searchCancelled = false;
+            totalNodes = 0; ttHits = 0; ttLookups = 0; highestReachedDepth = 0;
+
+            vector<Move> validMoves = getValidMoves(b, myColor);
+            if (validMoves.empty()) return { -1, -1, false, 0, 0 };
+            if (validMoves.size() == 1) return validMoves[0];
+
+            bestMoveOverall = validMoves[0];
+
+            int numThreads = (int)std::thread::hardware_concurrency();
+            if (numThreads == 0) numThreads = 4;
 
             vector<thread> workers;
 
-            for (int t = 0; t < THREAD_COUNT; t++) {
-                workers.emplace_back([&]() {
-                    while (true) {
-                        int index = nextIndex.fetch_add(1);
+            for (int t = 0; t < numThreads; t++) {
+                workers.emplace_back([&, t, validMoves, myColor, b, strat_dis, strat_even, strat_adv]() {
+                    vector<Move> threadMoves = validMoves;
 
-                        if (index >= (int)moves.size() || timeOver)
-                            break;
+                    if (t > 0) {
+                        mt19937 rng(12345 + t);
+                        shuffle(threadMoves.begin() + 1, threadMoves.end(), rng);
+                    }
 
-                        Move m = moves[index];
-                        Bitboard nextB = applyMove(board, m, myColor);
+                    Move localBestMove = threadMoves[0];
 
-                        int score = minimax(
-                            nextB,
-                            currentDepth - 1,
-                            -INF,
-                            INF,
-                            false,
-                            myColor
-                        );
+                    for (int depth = 1; depth <= 100; depth++) {
+                        int maxEval = -INF, alpha = -INF, beta = INF;
+                        Move depthBestMove = threadMoves[0];
 
-                        if (timeOver)
-                            break;
+                        auto it = find(threadMoves.begin(), threadMoves.end(), localBestMove);
+                        if (it != threadMoves.end() && it != threadMoves.begin()) {
+                            iter_swap(threadMoves.begin(), it);
+                        }
 
-                        lock_guard<mutex> lock(bestMutex);
+                        for (const Move& m : threadMoves) {
+                            Bitboard nextB = applyMove(b, m, myColor);
+                            int eval = minimax(nextB, depth - 1, alpha, beta, false, myColor, strat_dis, strat_even, strat_adv);
+                            if (searchCancelled) break;
 
-                        if (score > bestScore) {
-                            bestScore = score;
-                            depthBestMove = m;
+                            if (eval > maxEval) { maxEval = eval; depthBestMove = m; }
+                            alpha = max(alpha, eval);
+                        }
+
+                        if (searchCancelled) break;
+                        localBestMove = depthBestMove;
+
+                        lock_guard<mutex> lock(bestMoveMutex);
+                        if (depth > highestReachedDepth || (t == 0 && depth == highestReachedDepth)) {
+                            highestReachedDepth = depth;
+                            bestMoveOverall = localBestMove;
                         }
                     }
                     });
             }
 
-            for (thread& th : workers) {
-                if (th.joinable())
-                    th.join();
+            auto start = high_resolution_clock::now();
+            while (duration<double>(high_resolution_clock::now() - start).count() < timeLimitSeconds) {
+                this_thread::sleep_for(milliseconds(5));
             }
 
-            if (!timeOver) {
-                globalBestMove = depthBestMove;
-                reachedDepth = currentDepth;
+            searchCancelled = true;
+
+            for (auto& w : workers) {
+                if (w.joinable()) w.join();
             }
+
+            return bestMoveOverall;
         }
+    };
 
-        return globalBestMove;
-    }
-};
-
-atomic<long long> GPTAI::totalNodes = 0;
-atomic<long long> GPTAI::ttHits = 0;
-atomic<long long> GPTAI::ttLookups = 0;
-
-time_point<steady_clock> GPTAI::searchStartTime;
-atomic<bool> GPTAI::timeOver = false;
-int GPTAI::reachedDepth = 0;
-
-void initEngine() {
-    mt19937_64 rng(12345);
-
-    for (int i = 0; i < 49; i++) {
-        ADJ_MASK[i] = 0;
-        JUMP_MASK[i] = 0;
-
-        ZOBRIST[i][0] = rng();
-        ZOBRIST[i][1] = rng();
-
-        int r = i / 7;
-        int c = i % 7;
-
-        for (int dr = -2; dr <= 2; dr++) {
-            for (int dc = -2; dc <= 2; dc++) {
-                if (dr == 0 && dc == 0)
-                    continue;
-
-                int nr = r + dr;
-                int nc = c + dc;
-
-                if (nr < 0 || nr >= 7 || nc < 0 || nc >= 7)
-                    continue;
-
-                int nidx = nr * 7 + nc;
-                int dist = max(abs(dr), abs(dc));
-
-                if (dist == 1) {
-                    ADJ_MASK[i] |= (1ULL << nidx);
-                }
-                else if (dist == 2) {
-                    JUMP_MASK[i] |= (1ULL << nidx);
+    void initEngine() {
+        mt19937_64 rng(12345);
+        for (int i = 0; i < 49; i++) {
+            ADJ_MASK[i] = 0; JUMP_MASK[i] = 0;
+            ZOBRIST_TABLE[i][0] = rng(); ZOBRIST_TABLE[i][1] = rng();
+            int r = i / 7; int c = i % 7;
+            for (int dr = -2; dr <= 2; dr++) {
+                for (int dc = -2; dc <= 2; dc++) {
+                    if (dr == 0 && dc == 0) continue;
+                    int nr = r + dr; int nc = c + dc;
+                    if (nr < 0 || nr >= 7 || nc < 0 || nc >= 7) continue;
+                    int nidx = nr * 7 + nc;
+                    int dist = max(abs(dr), abs(dc));
+                    if (dist == 1) ADJ_MASK[i] |= (1ULL << nidx);
+                    else if (dist == 2) JUMP_MASK[i] |= (1ULL << nidx);
                 }
             }
         }
+        ZOBRIST_TURN = rng();
     }
-
-    ZOBRIST_TURN = rng();
-}
-
-int main() {
-    cout << "Program Start\n";
-
-    initEngine();
-
-    Bitboard board;
-    board.init();
-
-    int turn = PLAYER1;
-    int turns = 0;
-
-    while (!board.isGameOver() && turns < 200) {
-        vector<Move> moves = GPTAI::getValidMoves(board, turn);
-
-        if (!moves.empty()) {
-            cout << "Turn " << turns + 1
-                << " | Player " << turn
-                << " thinking...\n";
-
-            Move bestMove = GPTAI::getBestMove(board, turn);
-
-            cout << "Reached Depth: " << GPTAI::reachedDepth << "\n";
-
-            board = GPTAI::applyMove(board, bestMove, turn);
-        }
-
-        turn = (turn == PLAYER1) ? PLAYER2 : PLAYER1;
-        turns++;
-    }
-
-    int p1 = popcount64(board.p1);
-    int p2 = popcount64(board.p2);
-
-    cout << "\n===== RESULT =====\n";
-    cout << "PLAYER1: " << p1 << endl;
-    cout << "PLAYER2: " << p2 << endl;
-
-    if (p1 > p2)
-        cout << "PLAYER1 WIN\n";
-    else if (p2 > p1)
-        cout << "PLAYER2 WIN\n";
-    else
-        cout << "DRAW\n";
-
-    double hitRate =
-        (GPTAI::ttLookups > 0)
-        ? ((double)GPTAI::ttHits / GPTAI::ttLookups) * 100.0
-        : 0.0;
-
-    cout << "\nTT Hit Rate: " << hitRate << "%\n";
-    cout << "Total Nodes: " << GPTAI::totalNodes << endl;
-
-    system("pause");
-
-    return 0;
-}
+} // end namespace Teammate
