@@ -87,7 +87,6 @@ namespace Chiung {
 
     class AtaxxEngine {
     public:
-        // [수정] main.cpp가 찾고 있는 변수명 totalGameNodes로 완벽 동기화
         inline static atomic<long long> totalGameNodes{ 0 };
         inline static atomic<long long> ttHits{ 0 };
         inline static atomic<long long> ttLookups{ 0 };
@@ -96,31 +95,74 @@ namespace Chiung {
         inline static int highestReachedDepth = 0;
         inline static mutex bestMoveMutex;
 
+        // =====================================================================
+        // 🔥 V10 진화형 평가 함수 (킬각 + 진로 방해 + 코너 장악 + 중앙 교착 타파)
+        // =====================================================================
         static int evaluate(const Bitboard& b, int myColor) {
             uint64_t my = (myColor == PLAYER1) ? b.p1 : b.p2;
             uint64_t opp = (myColor == PLAYER1) ? b.p2 : b.p1;
             uint64_t empty = ~(b.p1 | b.p2) & FULL_BOARD_MASK;
 
-            int myCount = popcount64(my); int oppCount = popcount64(opp);
+            int myCount = popcount64(my);
+            int oppCount = popcount64(opp);
             int total = myCount + oppCount;
+
+            // 1. [약점 극복] 킬각 강제 인식 (스탯 농사 및 능욕 방지)
+            if (oppCount == 0) return INF;   // 적 전멸 시 무조건 100만점 (즉시 승리)
+            if (myCount == 0) return -INF;   // 내 전멸 시 -100만점 (절대 회피)
             if (total == 0) return 0;
 
             double myPercent = ((double)myCount / total) * 100.0;
             int pScore = myCount - oppCount;
-            int mScore = 0, dScore = 0;
 
+            // 2. [약점 극복] 나와 상대의 '기동성/밀집도 차이(Diff)' 계산 (섀도복싱 방지 및 진로 차단)
+            int myMobility = 0, myDensity = 0;
             uint64_t temp = my;
             while (temp) {
                 int idx = ctz64(temp);
-                dScore += popcount64(ADJ_MASK[idx] & my);
-                mScore += popcount64((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty);
+                myDensity += popcount64(ADJ_MASK[idx] & my);
+                myMobility += popcount64((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty);
                 temp &= temp - 1;
             }
 
-            if (myPercent < 45.0) return pScore * 10 + dScore * 60;
-            else if (myPercent <= 55.0) return pScore * 20 + mScore * 80;
-            else return pScore * 100;
+            int oppMobility = 0, oppDensity = 0;
+            temp = opp;
+            while (temp) {
+                int idx = ctz64(temp);
+                oppDensity += popcount64(ADJ_MASK[idx] & opp);
+                oppMobility += popcount64((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty);
+                temp &= temp - 1;
+            }
+
+            // 내가 갈 수 있는 곳 - 적이 갈 수 있는 곳 = 상대방 억제력
+            int mDiff = myMobility - oppMobility;
+            int dDiff = myDensity - oppDensity;
+
+            // 3. [약점 극복] 절대 방어 구역(코너) 장악 가중치 추가
+            // 인덱스 0(좌상단), 6(우상단), 42(좌하단), 48(우하단)
+            uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
+            int cDiff = popcount64(my & corners) - popcount64(opp & corners);
+
+            // 4. [약점 극복] 무승부 방지용 교착 상태 타파 (중앙 장악력 미세 보너스)
+            // 인덱스 16, 17, 18, 23, 24, 25, 30, 31, 32 (중앙 3x3 구역)
+            uint64_t center = 0x10E070000ULL;
+            int centerDiff = popcount64(my & center) - popcount64(opp & center);
+
+            // 5. 업그레이드된 유불리 동적 휴리스틱 (페이즈 분리 적용)
+            if (myPercent < 45.0) {
+                // 불리할 때: 돌 차이(10) 무시, 무조건 적 길막(mDiff 70) 및 뭉치기(dDiff 50), 코너 확보(200)에 올인
+                return pScore * 10 + mDiff * 70 + dDiff * 50 + cDiff * 200 + centerDiff * 5;
+            }
+            else if (myPercent <= 55.0) {
+                // 팽팽할 때: 돌 차이(20)보다 상대 억제(mDiff 90)에 치중하며 난전 유도
+                return pScore * 20 + mDiff * 90 + dDiff * 10 + cDiff * 200 + centerDiff * 10;
+            }
+            else {
+                // 유리할 때: 기교 부리지 말고 확실하게 돌 개수 격차(120)를 벌려 압살
+                return pScore * 120 + mDiff * 20 + cDiff * 100 + centerDiff * 2;
+            }
         }
+        // =====================================================================
 
         static int minimax(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor) {
             if (searchCancelled) return 0;
@@ -258,7 +300,6 @@ namespace Chiung {
             return globalBestMove;
         }
 
-        // [누락 복구 완료] 멀티스레드 시간제한 + 뎁스 무제한 탐색 함수
         static Move getBestMoveTimeLimited(const Bitboard& b, int myColor, double timeLimitSeconds) {
             searchCancelled = false;
             totalGameNodes = 0; ttHits = 0; ttLookups = 0; highestReachedDepth = 0;
