@@ -95,7 +95,6 @@ namespace Chiung {
         inline static int highestReachedDepth = 0;
         inline static mutex bestMoveMutex;
 
-        // [추가] 특정 플레이어가 움직일 수 있는 유효 경로가 있는지 1칸이라도 있는지 고속으로 검사
         static bool hasValidMoves(const Bitboard& b, int color) {
             uint64_t my = (color == PLAYER1) ? b.p1 : b.p2;
             uint64_t empty = ~(b.p1 | b.p2) & FULL_BOARD_MASK;
@@ -121,7 +120,6 @@ namespace Chiung {
             if (myCount == 0) return -INF;
             if (total == 0) return 0;
 
-            // [추가] 싹쓸이 승리 조건 인지: 상대방이 고립되어 갈 곳이 없으면 즉시 100만 점!
             if (!hasValidMoves(b, (myColor == PLAYER1 ? PLAYER2 : PLAYER1))) return INF;
             if (!hasValidMoves(b, myColor)) return -INF;
 
@@ -162,7 +160,9 @@ namespace Chiung {
                 return pScore * 20 + mDiff * 90 + dDiff * 10 + cDiff * 200 + centerDiff * 10;
             }
             else {
-                return pScore * 120 + mDiff * 20 + cDiff * 100 + centerDiff * 2;
+                // [수정 부위 1] 점유율이 55%를 넘어가 유리해지면, 기동성(mDiff) 가중치를 아예 0으로 없앱니다.
+                // 대신 1칸 복제의 혜택인 '돌 개수(pScore)' 점수를 500으로 폭등시켜 무조건 빈칸을 채우게 만듭니다.
+                return pScore * 500 + cDiff * 100 + centerDiff * 2;
             }
         }
 
@@ -193,7 +193,6 @@ namespace Chiung {
             int currColor = isMax ? myColor : (myColor == PLAYER1 ? PLAYER2 : PLAYER1);
             vector<Move> moves = getValidMoves(b, currColor);
 
-            // 유효 무브가 없다면 어차피 강제 종료(Sweep) 대상이므로 바로 평가함수로 던짐
             if (moves.empty()) return evaluate(b, myColor);
 
             int best = isMax ? -INF : INF;
@@ -202,6 +201,13 @@ namespace Chiung {
                 int val = minimax(nextB, depth - 1, alpha, beta, !isMax, myColor);
 
                 if (searchCancelled) return 0;
+
+                // [수정 부위 2] 1칸 복제 절대 우대 (가산점 부여)
+                // 점프와 복제의 가치가 비슷할 때, 1칸 복제(Clone)에 +15점의 가산점을 부여해 무한 점프를 차단합니다.
+                if (m.isClone) {
+                    if (isMax) val += 15;
+                    else val -= 15;
+                }
 
                 if (isMax) { best = max(best, val); alpha = max(alpha, best); }
                 else { best = min(best, val); beta = min(beta, best); }
@@ -344,6 +350,10 @@ namespace Chiung {
                             int eval = minimax(nextB, depth - 1, alpha, beta, false, myColor);
 
                             if (searchCancelled) break;
+
+                            if (m.isClone) {
+                                eval += 15; // 멀티스레드 내부에서도 1칸 복제 보너스 적용
+                            }
 
                             if (eval > maxEval) { maxEval = eval; depthBestMove = m; }
                             alpha = max(alpha, eval);
