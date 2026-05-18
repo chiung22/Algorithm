@@ -53,17 +53,29 @@ namespace Chiung {
     inline static uint64_t ZOBRIST_TURN;
 
     enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
-    struct TTEntry { uint64_t hash = 0; int depth = -1; int value = 0; TTFlag flag = EXACT; };
+
+    // [수정] Move 구조체에 기본 생성자 값 추가 (TT 저장을 위함)
+    struct Move {
+        int from = -1, to = -1; bool isClone = false; int infectCount = 0; int orderScore = 0;
+        bool operator<(const Move& other) const { return orderScore > other.orderScore; }
+        bool operator==(const Move& other) const { return from == other.from && to == other.to && isClone == other.isClone; }
+    };
+
+    // [수정] 해시 테이블(TT)에 '최적의 수(bestMove)'를 기억할 수 있도록 확장
+    struct TTEntry {
+        uint64_t hash;
+        int depth;
+        int value;
+        TTFlag flag;
+        Move bestMove;
+        // main.cpp 하위 호환성을 위한 생성자
+        TTEntry(uint64_t h = 0, int d = -1, int v = 0, TTFlag f = EXACT, Move m = Move())
+            : hash(h), depth(d), value(v), flag(f), bestMove(m) {}
+    };
 
     inline static vector<TTEntry> TT_Cache(TT_SIZE);
     inline static mutex ttMutex;
     inline static atomic<bool> searchCancelled{ false };
-
-    struct Move {
-        int from, to; bool isClone; int infectCount; int orderScore;
-        bool operator<(const Move& other) const { return orderScore > other.orderScore; }
-        bool operator==(const Move& other) const { return from == other.from && to == other.to && isClone == other.isClone; }
-    };
 
     struct Bitboard {
         uint64_t p1 = 0, p2 = 0, hashKey = 0;
@@ -115,6 +127,7 @@ namespace Chiung {
             int myCount = popcount64(my);
             int oppCount = popcount64(opp);
             int total = myCount + oppCount;
+            int emptyCount = popcount64(empty);
 
             if (oppCount == 0) return INF;
             if (myCount == 0) return -INF;
@@ -123,9 +136,16 @@ namespace Chiung {
             if (!hasValidMoves(b, (myColor == PLAYER1 ? PLAYER2 : PLAYER1))) return INF;
             if (!hasValidMoves(b, myColor)) return -INF;
 
-            double myPercent = ((double)myCount / total) * 100.0;
             int pScore = myCount - oppCount;
 
+            // [핵심 변경 1] 종반전 솔버 (Endgame Solver)
+            // 보드판 빈칸이 12개 이하로 남은 후반부에는 위치나 코너 가중치를 전부 꺼버립니다.
+            // 오직 "내 돌을 극단적으로 늘리는 수"만 10,000배로 증폭하여 변수 없이 찍어 누릅니다.
+            if (emptyCount <= 12) {
+                return pScore * 10000;
+            }
+
+            double myPercent = ((double)myCount / total) * 100.0;
             int myMobility = 0, myDensity = 0;
             uint64_t temp = my;
             while (temp) {
@@ -160,8 +180,6 @@ namespace Chiung {
                 return pScore * 20 + mDiff * 90 + dDiff * 10 + cDiff * 200 + centerDiff * 10;
             }
             else {
-                // [수정 부위 1] 점유율이 55%를 넘어가 유리해지면, 기동성(mDiff) 가중치를 아예 0으로 없앱니다.
-                // 대신 1칸 복제의 혜택인 '돌 개수(pScore)' 점수를 500으로 폭등시켜 무조건 빈칸을 채우게 만듭니다.
                 return pScore * 500 + cDiff * 100 + centerDiff * 2;
             }
         }
@@ -174,17 +192,27 @@ namespace Chiung {
             int alphaOrig = alpha;
             int ttIndex = (int)(b.hashKey & (TT_SIZE - 1));
 
+            Move ttBestMove;
+            bool hasTtMove = false;
+
             {
                 lock_guard<mutex> lock(ttMutex);
                 TTEntry& tte = TT_Cache[ttIndex];
                 ttLookups.fetch_add(1, memory_order_relaxed);
 
-                if (tte.hash == b.hashKey && tte.depth >= depth) {
-                    ttHits.fetch_add(1, memory_order_relaxed);
-                    if (tte.flag == EXACT) return tte.value;
-                    if (tte.flag == LOWERBOUND) alpha = max(alpha, tte.value);
-                    if (tte.flag == UPPERBOUND) beta = min(beta, tte.value);
-                    if (alpha >= beta) return tte.value;
+                if (tte.hash == b.hashKey) {
+                    // [핵심 변경 2] 무브 오더링을 위해 과거에 탐색했던 최고의 수(Best Move)를 꺼내옴
+                    if (tte.bestMove.to != -1) {
+                        ttBestMove = tte.bestMove;
+                        hasTtMove = true;
+                    }
+                    if (tte.depth >= depth) {
+                        ttHits.fetch_add(1, memory_order_relaxed);
+                        if (tte.flag == EXACT) return tte.value;
+                        if (tte.flag == LOWERBOUND) alpha = max(alpha, tte.value);
+                        if (tte.flag == UPPERBOUND) beta = min(beta, tte.value);
+                        if (alpha >= beta) return tte.value;
+                    }
                 }
             }
 
@@ -195,29 +223,46 @@ namespace Chiung {
 
             if (moves.empty()) return evaluate(b, myColor);
 
+            // [핵심 변경 2] 무브 오더링 (Move Ordering) 적용
+            // 과거 해시 테이블에서 효과가 입증된 수가 있다면, 
+            // 그 수를 vector의 맨 앞(0번 인덱스)으로 강제 스왑하여 가장 먼저 탐색하게 만듭니다.
+            if (hasTtMove) {
+                auto it = find(moves.begin(), moves.end(), ttBestMove);
+                if (it != moves.end() && it != moves.begin()) {
+                    iter_swap(moves.begin(), it);
+                }
+            }
+
             int best = isMax ? -INF : INF;
+            Move currentBestMove = moves[0];
+
             for (auto& m : moves) {
                 Bitboard nextB = applyMove(b, m, currColor);
                 int val = minimax(nextB, depth - 1, alpha, beta, !isMax, myColor);
 
                 if (searchCancelled) return 0;
 
-                // [수정 부위 2] 1칸 복제 절대 우대 (가산점 부여)
-                // 점프와 복제의 가치가 비슷할 때, 1칸 복제(Clone)에 +15점의 가산점을 부여해 무한 점프를 차단합니다.
                 if (m.isClone) {
                     if (isMax) val += 15;
                     else val -= 15;
                 }
 
-                if (isMax) { best = max(best, val); alpha = max(alpha, best); }
-                else { best = min(best, val); beta = min(beta, best); }
-                if (beta <= alpha) break;
+                if (isMax) {
+                    if (val > best) { best = val; currentBestMove = m; }
+                    alpha = max(alpha, best);
+                }
+                else {
+                    if (val < best) { best = val; currentBestMove = m; }
+                    beta = min(beta, best);
+                }
+                if (beta <= alpha) break; // 완벽한 무브 오더링으로 인한 알파-베타 가지치기 극대화 지점!
             }
 
             {
                 lock_guard<mutex> lock(ttMutex);
                 TTEntry& tte = TT_Cache[ttIndex];
-                tte.hash = b.hashKey; tte.depth = depth; tte.value = best;
+                // [수정] 해시 테이블에 현재 턴의 최적 수(currentBestMove)를 저장해둠
+                tte.hash = b.hashKey; tte.depth = depth; tte.value = best; tte.bestMove = currentBestMove;
                 if (best <= alphaOrig) tte.flag = UPPERBOUND;
                 else if (best >= beta) tte.flag = LOWERBOUND;
                 else tte.flag = EXACT;
@@ -352,7 +397,7 @@ namespace Chiung {
                             if (searchCancelled) break;
 
                             if (m.isClone) {
-                                eval += 15; // 멀티스레드 내부에서도 1칸 복제 보너스 적용
+                                eval += 15;
                             }
 
                             if (eval > maxEval) { maxEval = eval; depthBestMove = m; }

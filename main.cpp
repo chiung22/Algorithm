@@ -10,11 +10,6 @@
 using namespace std;
 using namespace std::chrono;
 
-// =====================================================================
-// [설정 스위치] 중계 모드 vs 초고속 모드
-// =====================================================================
-// true로 설정하면 보드판과 턴 진행 상황이 콘솔에 화려하게 중계됩니다. (1~5판 관전용 추천)
-// false로 설정하면 화면 출력을 끄고 빛의 속도로 엑셀 지표만 추출합니다. (100~1000판용 추천)
 const bool SHOW_BROADCAST = false; // true: 관전 모드, false: 데이터 추출 모드
 
 Teammate::Bitboard convertToTeammateBoard(const Chiung::Bitboard& cb) {
@@ -44,25 +39,43 @@ void printBoard(const Chiung::Bitboard& b) {
         cout << "|\n";
     }
     cout << "  +---------------+\n";
-    cout << "📊 현재 스코어 -> [치웅 V10(●): " << Chiung::popcount64(b.p1)
+    cout << "📊 현재 스코어 -> [치웅 V10.1(●): " << Chiung::popcount64(b.p1)
         << "개] vs [팀원 V2(○): " << Chiung::popcount64(b.p2) << "개]\n";
     cout << "---------------------------------------------------------\n\n";
+}
+
+// [추가 기능] 파일 덮어쓰기 방지를 위한 자동 넘버링 탐색 함수
+string getNextFilename(const string& baseName, const string& extension) {
+    int counter = 1;
+    string filename;
+    while (true) {
+        filename = baseName + "_" + to_string(counter) + extension;
+        ifstream f(filename.c_str());
+        if (!f.good()) {
+            break; // 해당 번호의 파일이 존재하지 않으면 루프 탈출 (이 이름으로 생성)
+        }
+        counter++;
+    }
+    return filename;
 }
 
 int main() {
     Chiung::AtaxxEngine::initMasks();
     Teammate::initEngine();
 
-    ofstream csv("Algorithm_Metrics_FairFight.csv");
+    // [수정] 고정된 파일명 대신 자동 넘버링 생성 함수를 호출하여 파일명 결정
+    string outFileName = getNextFilename("Algorithm_Metrics_FairFight", ".csv");
+    ofstream csv(outFileName);
+
     csv << "게임번호,시간제한(초),승리자,치웅_최저점유율_%,팀원_최저점유율_%,치웅_평균시간_ms,팀원_평균시간_ms,치웅_NPS,팀원_NPS,총턴수\n";
 
     cout << "=========================================================\n";
-    cout << " 🚀 GEMINI VS GPT 대결 \n";
+    cout << " 🚀 GEMINI VS GPT 대결\n";
     cout << "=========================================================\n";
-    cout << "- P1: 치웅 엔진 V10\n";
+    cout << "- P1: 치웅 엔진 V10.1\n";
     cout << "- P2: 팀원 엔진 V2\n";
-    
-    // [설정] 판수 및 시간제한
+    cout << "💾 저장될 파일명: " << outFileName << "\n\n";
+
     int gameID = 1;
     const int ITERATIONS = 100;
     const double TIME_LIMIT = 0.05;
@@ -95,21 +108,20 @@ int main() {
 
         while (!board.isGameOver() && turns < 200) {
 
-            // [추가] 턴 시작 전 심판의 고립 상태 판정 (Sweep 룰 체커)
             bool p1CanMove = Chiung::AtaxxEngine::hasValidMoves(board, Chiung::PLAYER1);
             bool p2CanMove = Chiung::AtaxxEngine::hasValidMoves(board, Chiung::PLAYER2);
 
             if (!p1CanMove || !p2CanMove) {
                 uint64_t empty = ~(board.p1 | board.p2) & Chiung::FULL_BOARD_MASK;
                 if (p1CanMove && !p2CanMove) {
-                    board.p1 |= empty; // 치웅이 남은 빈칸 전부 흡수
+                    board.p1 |= empty;
                     if (SHOW_BROADCAST) cout << "🧹 [싹쓸이 발동] 팀원 AI 고립! 치웅 AI(P1)가 남은 빈칸을 모두 복제하며 즉시 승리합니다!\n";
                 }
                 else if (!p1CanMove && p2CanMove) {
-                    board.p2 |= empty; // 팀원이 남은 빈칸 전부 흡수
+                    board.p2 |= empty;
                     if (SHOW_BROADCAST) cout << "🧹 [싹쓸이 발동] 치웅 AI 고립! 팀원 AI(P2)가 남은 빈칸을 모두 복제하며 즉시 승리합니다!\n";
                 }
-                break; // 무의미한 턴 낭비 없이 게임루프 즉각 탈출
+                break;
             }
 
             int p1Count = Chiung::popcount64(board.p1);
@@ -198,6 +210,6 @@ int main() {
     cout << "\n🔥 제한시간 " << TIME_LIMIT << "초 공정 대결 최종 결과 | 치웅 승: " << p1Wins << " / 팀원 승: " << p2Wins << " / 무승부: " << draws << "\n\n";
 
     csv.close();
-    cout << "✅ 시뮬레이션 끝! 모든 지표가 'Algorithm_Metrics_FairFight.csv' 파일에 저장되었습니다.\n";
+    cout << "✅ 시뮬레이션 끝! 모든 지표가 '" << outFileName << "' 파일에 저장되었습니다.\n";
     return 0;
 }
