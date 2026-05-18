@@ -43,7 +43,7 @@ int main() {
     int gameID = 1;
 
     // 판수 설정 부분 
-    const int ITERATIONS = 100;
+    const int ITERATIONS = 200;
     // 판수 설정 부분
     const double TIME_LIMIT = 1.0; // 턴당 제한시간 1초
 
@@ -66,8 +66,8 @@ int main() {
         // [수정 포인트 1] 매 턴 지워지는 엔진 내부 카운트 대신 게임 단위 누적용 변수 신설
         long long p1TotalNodesAccum = 0;
         long long p2TotalNodesAccum = 0;
-
-        while (!board.isGameOver() && turns < 200) {
+        // min = 80, max = 100
+        while (!board.isGameOver() && turns < 80) {
             int p1Count = Chiung::popcount64(board.p1);
             int totalCount = p1Count + Chiung::popcount64(board.p2);
             if (totalCount > 4) {
