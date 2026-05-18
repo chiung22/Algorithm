@@ -129,8 +129,8 @@ namespace Chiung {
 
             int pScore = myCount - oppCount;
 
-            // [수정 1] 엔드게임 솔버: 빈칸 15칸에서 17칸으로 변경 (빠른 수읽기)
-            if (emptyCount <= 17) {
+            // [수정 1] 보스 V2(17칸)를 선제 타격하기 위한 '18칸 솔버' 조기 발동
+            if (emptyCount <= 18) {
                 return pScore * 10000;
             }
 
@@ -157,7 +157,6 @@ namespace Chiung {
             uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
             int cDiff = popcount64(my & corners) - popcount64(opp & corners);
 
-            // [수정 2] Danger Zone 감점: 위험 구역 밟으면 -95 점수 페널티 (기존 -80에서 강화)
             uint64_t danger = (1ULL << 1) | (1ULL << 5) | (1ULL << 7) | (1ULL << 8) | (1ULL << 12) | (1ULL << 13) |
                 (1ULL << 35) | (1ULL << 36) | (1ULL << 40) | (1ULL << 41) | (1ULL << 43) | (1ULL << 47);
             int dangerDiff = popcount64(opp & danger) - popcount64(my & danger);
@@ -168,11 +167,9 @@ namespace Chiung {
             int mWeight = emptyCount * 3;
             int pWeight = 50 + (49 - emptyCount) * 5;
 
-            // 코너 가중치도 300에서 350으로 상승
             return pScore * pWeight + mDiff * mWeight + cDiff * 350 + dangerDiff * 95 + centerDiff * 10;
         }
 
-        // [수정 3] PVS(Principal Variation Search) 알고리즘 (기존 minimax 파괴)
         static int pvs(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor) {
             if (searchCancelled) return 0;
 
@@ -227,12 +224,10 @@ namespace Chiung {
                 int val = 0;
 
                 if (firstMove) {
-                    // 1순위 예상 정답 경로 (Full Window 탐색)
                     val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
                     firstMove = false;
                 }
                 else {
-                    // 나머지 하위 경로 (Null Window 탐색으로 고속 가지치기)
                     if (isMax) {
                         val = pvs(nextB, depth - 1, alpha, alpha + 1, !isMax, myColor);
                         if (val > alpha && val < beta) {
@@ -358,7 +353,6 @@ namespace Chiung {
 
                 for (const Move& m : validMoves) {
                     Bitboard nextB = applyMove(board, m, myColor);
-                    // PVS 호출로 교체
                     int score = pvs(nextB, currentDepth - 1, -INF, INF, false, myColor);
                     if (score > bestScore) { bestScore = score; depthBestMove = m; }
                 }
@@ -402,10 +396,24 @@ namespace Chiung {
                             iter_swap(threadMoves.begin(), it);
                         }
 
+                        // [수정 2] 최상단(Root) 노드부터 PVS(Null Window)를 돌리기 위한 플래그 추가
+                        bool rootFirst = true;
+
                         for (const Move& m : threadMoves) {
                             Bitboard nextB = applyMove(b, m, myColor);
-                            // [수정] minimax를 파괴하고 고속 PVS 알고리즘 반영
-                            int eval = pvs(nextB, depth - 1, alpha, beta, false, myColor);
+                            int eval = 0;
+
+                            // 루트 노드 PVS 적용: 1순위 수는 전체 창, 나머지는 닫힌 창으로 가지치기
+                            if (rootFirst) {
+                                eval = pvs(nextB, depth - 1, alpha, beta, false, myColor);
+                                rootFirst = false;
+                            }
+                            else {
+                                eval = pvs(nextB, depth - 1, alpha, alpha + 1, false, myColor);
+                                if (eval > alpha && eval < beta) {
+                                    eval = pvs(nextB, depth - 1, alpha, beta, false, myColor);
+                                }
+                            }
 
                             if (searchCancelled) break;
 
