@@ -129,8 +129,8 @@ namespace Chiung {
 
             int pScore = myCount - oppCount;
 
-            // [적용 1] 15칸 솔버: 15칸 남았을 때 모든 가중치 무시하고 압살
-            if (emptyCount <= 15) {
+            // [수정 1] 엔드게임 솔버: 빈칸 15칸에서 17칸으로 변경 (빠른 수읽기)
+            if (emptyCount <= 17) {
                 return pScore * 10000;
             }
 
@@ -157,7 +157,7 @@ namespace Chiung {
             uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
             int cDiff = popcount64(my & corners) - popcount64(opp & corners);
 
-            // [적용 2] Danger Zone 감점: 코너 주변 12칸을 밟으면 치명적 감점 (-80점)
+            // [수정 2] Danger Zone 감점: 위험 구역 밟으면 -95 점수 페널티 (기존 -80에서 강화)
             uint64_t danger = (1ULL << 1) | (1ULL << 5) | (1ULL << 7) | (1ULL << 8) | (1ULL << 12) | (1ULL << 13) |
                 (1ULL << 35) | (1ULL << 36) | (1ULL << 40) | (1ULL << 41) | (1ULL << 43) | (1ULL << 47);
             int dangerDiff = popcount64(opp & danger) - popcount64(my & danger);
@@ -165,14 +165,15 @@ namespace Chiung {
             uint64_t center = 0x10E070000ULL;
             int centerDiff = popcount64(my & center) - popcount64(opp & center);
 
-            // [적용 3] 연속 보간 가중치: 계단식(if문)을 버리고 남은 빈칸에 따라 유연하게 곡선 변화
-            int mWeight = emptyCount * 3; // 기동성: 초반(약 130) -> 후반(0)으로 자연 감소
-            int pWeight = 50 + (49 - emptyCount) * 5; // 돌 개수: 초반(50) -> 후반(약 250)으로 자연 증가
+            int mWeight = emptyCount * 3;
+            int pWeight = 50 + (49 - emptyCount) * 5;
 
-            return pScore * pWeight + mDiff * mWeight + cDiff * 300 + dangerDiff * 80 + centerDiff * 10;
+            // 코너 가중치도 300에서 350으로 상승
+            return pScore * pWeight + mDiff * mWeight + cDiff * 350 + dangerDiff * 95 + centerDiff * 10;
         }
 
-        static int minimax(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor) {
+        // [수정 3] PVS(Principal Variation Search) 알고리즘 (기존 minimax 파괴)
+        static int pvs(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor) {
             if (searchCancelled) return 0;
 
             totalGameNodes.fetch_add(1, memory_order_relaxed);
@@ -219,10 +220,32 @@ namespace Chiung {
 
             int best = isMax ? -INF : INF;
             Move currentBestMove = moves[0];
+            bool firstMove = true;
 
             for (auto& m : moves) {
                 Bitboard nextB = applyMove(b, m, currColor);
-                int val = minimax(nextB, depth - 1, alpha, beta, !isMax, myColor);
+                int val = 0;
+
+                if (firstMove) {
+                    // 1순위 예상 정답 경로 (Full Window 탐색)
+                    val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
+                    firstMove = false;
+                }
+                else {
+                    // 나머지 하위 경로 (Null Window 탐색으로 고속 가지치기)
+                    if (isMax) {
+                        val = pvs(nextB, depth - 1, alpha, alpha + 1, !isMax, myColor);
+                        if (val > alpha && val < beta) {
+                            val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
+                        }
+                    }
+                    else {
+                        val = pvs(nextB, depth - 1, beta - 1, beta, !isMax, myColor);
+                        if (val < beta && val > alpha) {
+                            val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
+                        }
+                    }
+                }
 
                 if (searchCancelled) return 0;
 
@@ -262,7 +285,6 @@ namespace Chiung {
                     int to = ctz64(clones);
                     int caps = popcount64(ADJ_MASK[to] & opp);
 
-                    // [적용 4] 딥 무브 오더링: 복제+포획 > 점프+포획 > 단순 복제 > 단순 점프
                     int orderScore = 0;
                     if (caps > 0) orderScore = 3000 + caps * 100;
                     else orderScore = 1000;
@@ -316,6 +338,35 @@ namespace Chiung {
             return b;
         }
 
+        static Move getBestMoveFixedDepth(const Bitboard& board, int myColor, int targetDepth) {
+            searchCancelled = false;
+            totalGameNodes = 0; ttHits = 0; ttLookups = 0;
+
+            vector<Move> validMoves = getValidMoves(board, myColor);
+            if (validMoves.empty()) return { -1, -1, false, 0, 0 };
+
+            Move globalBestMove = validMoves[0];
+
+            for (int currentDepth = 1; currentDepth <= targetDepth; currentDepth++) {
+                Move depthBestMove = globalBestMove;
+                int bestScore = -INF;
+
+                auto it = find_if(validMoves.begin(), validMoves.end(), [&](const Move& m) {
+                    return m.from == globalBestMove.from && m.to == globalBestMove.to && m.isClone == globalBestMove.isClone;
+                    });
+                if (it != validMoves.end() && it != validMoves.begin()) iter_swap(validMoves.begin(), it);
+
+                for (const Move& m : validMoves) {
+                    Bitboard nextB = applyMove(board, m, myColor);
+                    // PVS 호출로 교체
+                    int score = pvs(nextB, currentDepth - 1, -INF, INF, false, myColor);
+                    if (score > bestScore) { bestScore = score; depthBestMove = m; }
+                }
+                globalBestMove = depthBestMove;
+            }
+            return globalBestMove;
+        }
+
         static Move getBestMoveTimeLimited(const Bitboard& b, int myColor, double timeLimitSeconds) {
             searchCancelled = false;
             totalGameNodes = 0; ttHits = 0; ttLookups = 0; highestReachedDepth = 0;
@@ -353,7 +404,8 @@ namespace Chiung {
 
                         for (const Move& m : threadMoves) {
                             Bitboard nextB = applyMove(b, m, myColor);
-                            int eval = minimax(nextB, depth - 1, alpha, beta, false, myColor);
+                            // [수정] minimax를 파괴하고 고속 PVS 알고리즘 반영
+                            int eval = pvs(nextB, depth - 1, alpha, beta, false, myColor);
 
                             if (searchCancelled) break;
 
