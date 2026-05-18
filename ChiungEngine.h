@@ -95,9 +95,19 @@ namespace Chiung {
         inline static int highestReachedDepth = 0;
         inline static mutex bestMoveMutex;
 
-        // =====================================================================
-        // 🔥 V10 진화형 평가 함수 (킬각 + 진로 방해 + 코너 장악 + 중앙 교착 타파)
-        // =====================================================================
+        // [추가] 특정 플레이어가 움직일 수 있는 유효 경로가 있는지 1칸이라도 있는지 고속으로 검사
+        static bool hasValidMoves(const Bitboard& b, int color) {
+            uint64_t my = (color == PLAYER1) ? b.p1 : b.p2;
+            uint64_t empty = ~(b.p1 | b.p2) & FULL_BOARD_MASK;
+            uint64_t temp = my;
+            while (temp) {
+                int idx = ctz64(temp);
+                if ((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty) return true;
+                temp &= temp - 1;
+            }
+            return false;
+        }
+
         static int evaluate(const Bitboard& b, int myColor) {
             uint64_t my = (myColor == PLAYER1) ? b.p1 : b.p2;
             uint64_t opp = (myColor == PLAYER1) ? b.p2 : b.p1;
@@ -107,15 +117,17 @@ namespace Chiung {
             int oppCount = popcount64(opp);
             int total = myCount + oppCount;
 
-            // 1. [약점 극복] 킬각 강제 인식 (스탯 농사 및 능욕 방지)
-            if (oppCount == 0) return INF;   // 적 전멸 시 무조건 100만점 (즉시 승리)
-            if (myCount == 0) return -INF;   // 내 전멸 시 -100만점 (절대 회피)
+            if (oppCount == 0) return INF;
+            if (myCount == 0) return -INF;
             if (total == 0) return 0;
+
+            // [추가] 싹쓸이 승리 조건 인지: 상대방이 고립되어 갈 곳이 없으면 즉시 100만 점!
+            if (!hasValidMoves(b, (myColor == PLAYER1 ? PLAYER2 : PLAYER1))) return INF;
+            if (!hasValidMoves(b, myColor)) return -INF;
 
             double myPercent = ((double)myCount / total) * 100.0;
             int pScore = myCount - oppCount;
 
-            // 2. [약점 극복] 나와 상대의 '기동성/밀집도 차이(Diff)' 계산 (섀도복싱 방지 및 진로 차단)
             int myMobility = 0, myDensity = 0;
             uint64_t temp = my;
             while (temp) {
@@ -134,35 +146,25 @@ namespace Chiung {
                 temp &= temp - 1;
             }
 
-            // 내가 갈 수 있는 곳 - 적이 갈 수 있는 곳 = 상대방 억제력
             int mDiff = myMobility - oppMobility;
             int dDiff = myDensity - oppDensity;
 
-            // 3. [약점 극복] 절대 방어 구역(코너) 장악 가중치 추가
-            // 인덱스 0(좌상단), 6(우상단), 42(좌하단), 48(우하단)
             uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
             int cDiff = popcount64(my & corners) - popcount64(opp & corners);
 
-            // 4. [약점 극복] 무승부 방지용 교착 상태 타파 (중앙 장악력 미세 보너스)
-            // 인덱스 16, 17, 18, 23, 24, 25, 30, 31, 32 (중앙 3x3 구역)
             uint64_t center = 0x10E070000ULL;
             int centerDiff = popcount64(my & center) - popcount64(opp & center);
 
-            // 5. 업그레이드된 유불리 동적 휴리스틱 (페이즈 분리 적용)
             if (myPercent < 45.0) {
-                // 불리할 때: 돌 차이(10) 무시, 무조건 적 길막(mDiff 70) 및 뭉치기(dDiff 50), 코너 확보(200)에 올인
                 return pScore * 10 + mDiff * 70 + dDiff * 50 + cDiff * 200 + centerDiff * 5;
             }
             else if (myPercent <= 55.0) {
-                // 팽팽할 때: 돌 차이(20)보다 상대 억제(mDiff 90)에 치중하며 난전 유도
                 return pScore * 20 + mDiff * 90 + dDiff * 10 + cDiff * 200 + centerDiff * 10;
             }
             else {
-                // 유리할 때: 기교 부리지 말고 확실하게 돌 개수 격차(120)를 벌려 압살
                 return pScore * 120 + mDiff * 20 + cDiff * 100 + centerDiff * 2;
             }
         }
-        // =====================================================================
 
         static int minimax(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor) {
             if (searchCancelled) return 0;
@@ -190,6 +192,8 @@ namespace Chiung {
 
             int currColor = isMax ? myColor : (myColor == PLAYER1 ? PLAYER2 : PLAYER1);
             vector<Move> moves = getValidMoves(b, currColor);
+
+            // 유효 무브가 없다면 어차피 강제 종료(Sweep) 대상이므로 바로 평가함수로 던짐
             if (moves.empty()) return evaluate(b, myColor);
 
             int best = isMax ? -INF : INF;
