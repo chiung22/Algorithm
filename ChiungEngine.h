@@ -54,21 +54,14 @@ namespace Chiung {
 
     enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 
-    // [수정] Move 구조체에 기본 생성자 값 추가 (TT 저장을 위함)
     struct Move {
         int from = -1, to = -1; bool isClone = false; int infectCount = 0; int orderScore = 0;
         bool operator<(const Move& other) const { return orderScore > other.orderScore; }
         bool operator==(const Move& other) const { return from == other.from && to == other.to && isClone == other.isClone; }
     };
 
-    // [수정] 해시 테이블(TT)에 '최적의 수(bestMove)'를 기억할 수 있도록 확장
     struct TTEntry {
-        uint64_t hash;
-        int depth;
-        int value;
-        TTFlag flag;
-        Move bestMove;
-        // main.cpp 하위 호환성을 위한 생성자
+        uint64_t hash; int depth; int value; TTFlag flag; Move bestMove;
         TTEntry(uint64_t h = 0, int d = -1, int v = 0, TTFlag f = EXACT, Move m = Move())
             : hash(h), depth(d), value(v), flag(f), bestMove(m) {}
     };
@@ -126,26 +119,21 @@ namespace Chiung {
 
             int myCount = popcount64(my);
             int oppCount = popcount64(opp);
-            int total = myCount + oppCount;
             int emptyCount = popcount64(empty);
 
             if (oppCount == 0) return INF;
             if (myCount == 0) return -INF;
-            if (total == 0) return 0;
 
             if (!hasValidMoves(b, (myColor == PLAYER1 ? PLAYER2 : PLAYER1))) return INF;
             if (!hasValidMoves(b, myColor)) return -INF;
 
             int pScore = myCount - oppCount;
 
-            // [핵심 변경 1] 종반전 솔버 (Endgame Solver)
-            // 보드판 빈칸이 12개 이하로 남은 후반부에는 위치나 코너 가중치를 전부 꺼버립니다.
-            // 오직 "내 돌을 극단적으로 늘리는 수"만 10,000배로 증폭하여 변수 없이 찍어 누릅니다.
-            if (emptyCount <= 12) {
+            // [적용 1] 15칸 솔버: 15칸 남았을 때 모든 가중치 무시하고 압살
+            if (emptyCount <= 15) {
                 return pScore * 10000;
             }
 
-            double myPercent = ((double)myCount / total) * 100.0;
             int myMobility = 0, myDensity = 0;
             uint64_t temp = my;
             while (temp) {
@@ -165,23 +153,23 @@ namespace Chiung {
             }
 
             int mDiff = myMobility - oppMobility;
-            int dDiff = myDensity - oppDensity;
 
             uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
             int cDiff = popcount64(my & corners) - popcount64(opp & corners);
 
+            // [적용 2] Danger Zone 감점: 코너 주변 12칸을 밟으면 치명적 감점 (-80점)
+            uint64_t danger = (1ULL << 1) | (1ULL << 5) | (1ULL << 7) | (1ULL << 8) | (1ULL << 12) | (1ULL << 13) |
+                (1ULL << 35) | (1ULL << 36) | (1ULL << 40) | (1ULL << 41) | (1ULL << 43) | (1ULL << 47);
+            int dangerDiff = popcount64(opp & danger) - popcount64(my & danger);
+
             uint64_t center = 0x10E070000ULL;
             int centerDiff = popcount64(my & center) - popcount64(opp & center);
 
-            if (myPercent < 45.0) {
-                return pScore * 10 + mDiff * 70 + dDiff * 50 + cDiff * 200 + centerDiff * 5;
-            }
-            else if (myPercent <= 55.0) {
-                return pScore * 20 + mDiff * 90 + dDiff * 10 + cDiff * 200 + centerDiff * 10;
-            }
-            else {
-                return pScore * 500 + cDiff * 100 + centerDiff * 2;
-            }
+            // [적용 3] 연속 보간 가중치: 계단식(if문)을 버리고 남은 빈칸에 따라 유연하게 곡선 변화
+            int mWeight = emptyCount * 3; // 기동성: 초반(약 130) -> 후반(0)으로 자연 감소
+            int pWeight = 50 + (49 - emptyCount) * 5; // 돌 개수: 초반(50) -> 후반(약 250)으로 자연 증가
+
+            return pScore * pWeight + mDiff * mWeight + cDiff * 300 + dangerDiff * 80 + centerDiff * 10;
         }
 
         static int minimax(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor) {
@@ -201,7 +189,6 @@ namespace Chiung {
                 ttLookups.fetch_add(1, memory_order_relaxed);
 
                 if (tte.hash == b.hashKey) {
-                    // [핵심 변경 2] 무브 오더링을 위해 과거에 탐색했던 최고의 수(Best Move)를 꺼내옴
                     if (tte.bestMove.to != -1) {
                         ttBestMove = tte.bestMove;
                         hasTtMove = true;
@@ -223,9 +210,6 @@ namespace Chiung {
 
             if (moves.empty()) return evaluate(b, myColor);
 
-            // [핵심 변경 2] 무브 오더링 (Move Ordering) 적용
-            // 과거 해시 테이블에서 효과가 입증된 수가 있다면, 
-            // 그 수를 vector의 맨 앞(0번 인덱스)으로 강제 스왑하여 가장 먼저 탐색하게 만듭니다.
             if (hasTtMove) {
                 auto it = find(moves.begin(), moves.end(), ttBestMove);
                 if (it != moves.end() && it != moves.begin()) {
@@ -242,11 +226,6 @@ namespace Chiung {
 
                 if (searchCancelled) return 0;
 
-                if (m.isClone) {
-                    if (isMax) val += 15;
-                    else val -= 15;
-                }
-
                 if (isMax) {
                     if (val > best) { best = val; currentBestMove = m; }
                     alpha = max(alpha, best);
@@ -255,13 +234,12 @@ namespace Chiung {
                     if (val < best) { best = val; currentBestMove = m; }
                     beta = min(beta, best);
                 }
-                if (beta <= alpha) break; // 완벽한 무브 오더링으로 인한 알파-베타 가지치기 극대화 지점!
+                if (beta <= alpha) break;
             }
 
             {
                 lock_guard<mutex> lock(ttMutex);
                 TTEntry& tte = TT_Cache[ttIndex];
-                // [수정] 해시 테이블에 현재 턴의 최적 수(currentBestMove)를 저장해둠
                 tte.hash = b.hashKey; tte.depth = depth; tte.value = best; tte.bestMove = currentBestMove;
                 if (best <= alphaOrig) tte.flag = UPPERBOUND;
                 else if (best >= beta) tte.flag = LOWERBOUND;
@@ -283,7 +261,13 @@ namespace Chiung {
                 while (clones) {
                     int to = ctz64(clones);
                     int caps = popcount64(ADJ_MASK[to] & opp);
-                    moves.push_back({ from, to, true, caps, caps * 100 + 10 });
+
+                    // [적용 4] 딥 무브 오더링: 복제+포획 > 점프+포획 > 단순 복제 > 단순 점프
+                    int orderScore = 0;
+                    if (caps > 0) orderScore = 3000 + caps * 100;
+                    else orderScore = 1000;
+
+                    moves.push_back({ from, to, true, caps, orderScore });
                     clones &= clones - 1;
                 }
                 temp &= temp - 1;
@@ -296,7 +280,12 @@ namespace Chiung {
                 while (jumps) {
                     int to = ctz64(jumps);
                     int caps = popcount64(ADJ_MASK[to] & opp);
-                    moves.push_back({ from, to, false, caps, caps * 100 });
+
+                    int orderScore = 0;
+                    if (caps > 0) orderScore = 2000 + caps * 100;
+                    else orderScore = 0;
+
+                    moves.push_back({ from, to, false, caps, orderScore });
                     jumps &= jumps - 1;
                 }
                 temp &= temp - 1;
@@ -325,34 +314,6 @@ namespace Chiung {
             }
             b.hashKey ^= ZOBRIST_TURN;
             return b;
-        }
-
-        static Move getBestMoveFixedDepth(const Bitboard& board, int myColor, int targetDepth) {
-            searchCancelled = false;
-            totalGameNodes = 0; ttHits = 0; ttLookups = 0;
-
-            vector<Move> validMoves = getValidMoves(board, myColor);
-            if (validMoves.empty()) return { -1, -1, false, 0, 0 };
-
-            Move globalBestMove = validMoves[0];
-
-            for (int currentDepth = 1; currentDepth <= targetDepth; currentDepth++) {
-                Move depthBestMove = globalBestMove;
-                int bestScore = -INF;
-
-                auto it = find_if(validMoves.begin(), validMoves.end(), [&](const Move& m) {
-                    return m.from == globalBestMove.from && m.to == globalBestMove.to && m.isClone == globalBestMove.isClone;
-                    });
-                if (it != validMoves.end() && it != validMoves.begin()) iter_swap(validMoves.begin(), it);
-
-                for (const Move& m : validMoves) {
-                    Bitboard nextB = applyMove(board, m, myColor);
-                    int score = minimax(nextB, currentDepth - 1, -INF, INF, false, myColor);
-                    if (score > bestScore) { bestScore = score; depthBestMove = m; }
-                }
-                globalBestMove = depthBestMove;
-            }
-            return globalBestMove;
         }
 
         static Move getBestMoveTimeLimited(const Bitboard& b, int myColor, double timeLimitSeconds) {
@@ -395,10 +356,6 @@ namespace Chiung {
                             int eval = minimax(nextB, depth - 1, alpha, beta, false, myColor);
 
                             if (searchCancelled) break;
-
-                            if (m.isClone) {
-                                eval += 15;
-                            }
 
                             if (eval > maxEval) { maxEval = eval; depthBestMove = m; }
                             alpha = max(alpha, eval);
