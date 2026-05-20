@@ -6,13 +6,12 @@
 
 // =====================================================================
 // 💡 [유니버설 플레이어 설정]
-// 팀원과 코드를 공유할 때, 아래의 숫자만 변경하여 대진표를 만드세요!
 // =====================================================================
 #define ENGINE_CHIUNG 1
 #define ENGINE_TAEWAN 2
 #define ENGINE_BOSS   3
 
-// 👇 여기서 P1(흑돌)과 P2(백돌)에 참가할 엔진을 숫자로 지정하세요.
+// 👇 처음에 시작할 P1(흑)과 P2(백)를 지정하세요. (절반이 지나면 자동으로 바뀝니다)
 #define MATCH_P1 ENGINE_CHIUNG
 #define MATCH_P2 ENGINE_BOSS
 
@@ -39,7 +38,7 @@ using namespace std::chrono;
 // ---------------------------------------------------------------------
 string getEngineName(int engineType) {
     if (engineType == ENGINE_CHIUNG) return "치웅_V16";
-    if (engineType == ENGINE_TAEWAN) return "태완_V2";
+    if (engineType == ENGINE_TAEWAN) return "태완_V3";
     if (engineType == ENGINE_BOSS)   return "보스_카운터_V2";
     return "Unknown";
 }
@@ -73,7 +72,7 @@ Boss::Bitboard convertToBossBoard(const Chiung::Bitboard& cb) {
 }
 #endif
 
-// 공통 고립 검사 함수 (매크로 충돌 방지를 위해 상수 대신 숫자 1 사용)
+// 공통 고립 검사 함수
 bool checkValidMovesGlobally(const Chiung::Bitboard& b, int color) {
     uint64_t my = (color == 1) ? b.p1 : b.p2;
     uint64_t empty = ~(b.p1 | b.p2) & ((1ULL << 49) - 1);
@@ -87,7 +86,7 @@ bool checkValidMovesGlobally(const Chiung::Bitboard& b, int color) {
 }
 
 // ---------------------------------------------------------------------
-// 엔진 독립적 통신 구조체 및 래퍼 함수 (숫자 1, 2 직접 사용)
+// [수정 포인트 1] 동적 엔진 호출 래퍼 (런타임 진영 교체를 위함)
 // ---------------------------------------------------------------------
 struct MoveInfo {
     int from, to;
@@ -95,58 +94,41 @@ struct MoveInfo {
     double timeMs;
 };
 
-MoveInfo getP1Move(const Chiung::Bitboard& b, double timeLimit, long long& outNodes) {
-#if MATCH_P1 == ENGINE_CHIUNG
-    auto start = high_resolution_clock::now();
-    Chiung::Move m = Chiung::AtaxxEngine::getBestMoveTimeLimited(b, 1, timeLimit);
-    auto end = high_resolution_clock::now();
-    outNodes = Chiung::AtaxxEngine::totalGameNodes.load();
-    return { m.from, m.to, m.isClone, duration<double, std::milli>(end - start).count() };
-#elif MATCH_P1 == ENGINE_TAEWAN
-    Teammate::Bitboard tb = convertToTeammateBoard(b);
-    auto start = high_resolution_clock::now();
-    Teammate::Move m = Teammate::AtaxxEngine::getBestMoveTimeLimited(tb, 1, timeLimit, 1, 2, 3);
-    auto end = high_resolution_clock::now();
-    outNodes = Teammate::AtaxxEngine::totalNodes.load();
-    return { m.from, m.to, m.isClone, duration<double, std::milli>(end - start).count() };
-#elif MATCH_P1 == ENGINE_BOSS
-    Boss::Bitboard bb = convertToBossBoard(b);
-    auto start = high_resolution_clock::now();
-    Boss::Move m = Boss::AtaxxEngine::getBestMoveTimeLimited(bb, 1, timeLimit);
-    auto end = high_resolution_clock::now();
-    outNodes = Boss::AtaxxEngine::totalNodes.load();
-    return { m.from, m.to, m.isClone, duration<double, std::milli>(end - start).count() };
+MoveInfo getEngineMove(int engineType, const Chiung::Bitboard& b, int color, double timeLimit, long long& outNodes) {
+    if (engineType == ENGINE_CHIUNG) {
+        auto start = high_resolution_clock::now();
+        Chiung::Move m = Chiung::AtaxxEngine::getBestMoveTimeLimited(b, color, timeLimit);
+        auto end = high_resolution_clock::now();
+        outNodes = Chiung::AtaxxEngine::totalGameNodes.load();
+        return { m.from, m.to, m.isClone, duration<double, std::milli>(end - start).count() };
+    }
+#if (MATCH_P1 == ENGINE_BOSS) || (MATCH_P2 == ENGINE_BOSS)
+    else if (engineType == ENGINE_BOSS) {
+        Boss::Bitboard bb = convertToBossBoard(b);
+        auto start = high_resolution_clock::now();
+        Boss::Move m = Boss::AtaxxEngine::getBestMoveTimeLimited(bb, color, timeLimit);
+        auto end = high_resolution_clock::now();
+        outNodes = Boss::AtaxxEngine::totalNodes.load();
+        return { m.from, m.to, m.isClone, duration<double, std::milli>(end - start).count() };
+    }
 #endif
-}
-
-MoveInfo getP2Move(const Chiung::Bitboard& b, double timeLimit, long long& outNodes) {
-#if MATCH_P2 == ENGINE_CHIUNG
-    auto start = high_resolution_clock::now();
-    Chiung::Move m = Chiung::AtaxxEngine::getBestMoveTimeLimited(b, 2, timeLimit);
-    auto end = high_resolution_clock::now();
-    outNodes = Chiung::AtaxxEngine::totalGameNodes.load();
-    return { m.from, m.to, m.isClone, duration<double, std::milli>(end - start).count() };
-#elif MATCH_P2 == ENGINE_TAEWAN
-    Teammate::Bitboard tb = convertToTeammateBoard(b);
-    auto start = high_resolution_clock::now();
-    Teammate::Move m = Teammate::AtaxxEngine::getBestMoveTimeLimited(tb, 2, timeLimit, 1, 2, 3);
-    auto end = high_resolution_clock::now();
-    outNodes = Teammate::AtaxxEngine::totalNodes.load();
-    return { m.from, m.to, m.isClone, duration<double, std::milli>(end - start).count() };
-#elif MATCH_P2 == ENGINE_BOSS
-    Boss::Bitboard bb = convertToBossBoard(b);
-    auto start = high_resolution_clock::now();
-    Boss::Move m = Boss::AtaxxEngine::getBestMoveTimeLimited(bb, 2, timeLimit);
-    auto end = high_resolution_clock::now();
-    outNodes = Boss::AtaxxEngine::totalNodes.load();
-    return { m.from, m.to, m.isClone, duration<double, std::milli>(end - start).count() };
+#if (MATCH_P1 == ENGINE_TAEWAN) || (MATCH_P2 == ENGINE_TAEWAN)
+    else if (engineType == ENGINE_TAEWAN) {
+        Teammate::Bitboard tb = convertToTeammateBoard(b);
+        auto start = high_resolution_clock::now();
+        Teammate::Move m = Teammate::AtaxxEngine::getBestMoveTimeLimited(tb, color, timeLimit, 1, 2, 3);
+        auto end = high_resolution_clock::now();
+        outNodes = Teammate::AtaxxEngine::totalNodes.load();
+        return { m.from, m.to, m.isClone, duration<double, std::milli>(end - start).count() };
+    }
 #endif
+    return { -1, -1, false, 0.0 };
 }
 
 // ---------------------------------------------------------------------
 // 편의 기능 함수들
 // ---------------------------------------------------------------------
-void printBoard(const Chiung::Bitboard& b) {
+void printBoard(const Chiung::Bitboard& b, int current_p1, int current_p2) {
     cout << "\n    0 1 2 3 4 5 6  (열)\n";
     cout << "  +---------------+\n";
     for (int r = 0; r < 7; r++) {
@@ -160,8 +142,8 @@ void printBoard(const Chiung::Bitboard& b) {
         cout << "|\n";
     }
     cout << "  +---------------+\n";
-    cout << "📊 현재 스코어 -> [P1 " << getEngineName(MATCH_P1) << "(●): " << Chiung::popcount64(b.p1)
-        << "개] vs [P2 " << getEngineName(MATCH_P2) << "(○): " << Chiung::popcount64(b.p2) << "개]\n";
+    cout << "📊 현재 스코어 -> [P1 " << getEngineName(current_p1) << "(●): " << Chiung::popcount64(b.p1)
+        << "개] vs [P2 " << getEngineName(current_p2) << "(○): " << Chiung::popcount64(b.p2) << "개]\n";
     cout << "---------------------------------------------------------\n\n";
 }
 
@@ -186,26 +168,33 @@ int main() {
     Teammate::initEngine();
 #endif
 
-    string p1Name = getEngineName(MATCH_P1);
-    string p2Name = getEngineName(MATCH_P2);
-
-    string outFileName = getNextFilename("Metrics_" + p1Name + "_VS_" + p2Name + "_Analysis", ".csv");
+    string outFileName = getNextFilename("Metrics_AutoSwap_Analysis", ".csv");
     ofstream csv(outFileName);
 
-    // [수정 포인트 1] 헤더에 전략적 프로파일링 컬럼 일괄 추가
-    csv << "게임번호,시간제한(초),승리자,"
-        << p1Name << "_최저점유율_%," << p2Name << "_최저점유율_%,"
-        << p1Name << "_평균시간_ms," << p2Name << "_평균시간_ms,"
-        << p1Name << "_NPS," << p2Name << "_NPS,총턴수,"
+    if (!csv.is_open()) {
+        cout << "\n❌ [치명적 오류] CSV 파일을 생성할 수 없습니다!\n";
+        cout << "해결 방법:\n";
+        cout << "1. 엑셀에서 '" << outFileName << "' 파일이 이미 열려있다면 닫아주세요.\n";
+        cout << "2. 백신 프로그램이 파일 생성을 차단하고 있는지 확인하세요.\n\n";
+        system("pause");
+        return 1;
+    }
+
+    // [수정 포인트 2] P1, P2 엔진 이름을 명시하는 컬럼 추가 (데이터 피벗 분석을 위함)
+    csv << "게임번호,시간제한(초),P1_엔진(흑),P2_엔진(백),승리_진영,승리_엔진,"
+        << "P1_최저점유율_%,P2_최저점유율_%,"
+        << "P1_평균시간_ms,P2_평균시간_ms,"
+        << "P1_NPS,P2_NPS,총턴수,"
         << "Opening_Advantage,Midgame_Volatility,Solver_Efficiency_Score,"
         << "P1_Clone_Count,P1_Jump_Count,P2_Clone_Count,P2_Jump_Count,"
-        << "Corner_Grab_Turn,Peak_Advantage,Turning_Point\n";
+        << "Corner_Grab_Turn,Chiung_Peak_Advantage,Turning_Point\n";
+
+    int current_p1 = MATCH_P1;
+    int current_p2 = MATCH_P2;
 
     cout << "=========================================================\n";
-    cout << " 🚀 유니버설 AI 전략 프로파일링 시뮬레이터\n";
+    cout << " 🚀 유니버설 AI 자동 진영교체(Swap) 시뮬레이터\n";
     cout << "=========================================================\n";
-    cout << "- P1 (흑●): " << p1Name << "\n";
-    cout << "- P2 (백○): " << p2Name << "\n";
     cout << "💾 저장될 파일명: " << outFileName << "\n\n";
 
     int gameID = 1;
@@ -214,9 +203,18 @@ int main() {
 
     cout << "[제한시간 " << TIME_LIMIT << "초] " << ITERATIONS << "판 시뮬레이션 진행 중...\n";
 
-    int p1Wins = 0, p2Wins = 0, draws = 0;
+    // 누적 승수 트래커 (P1/P2 기준이 아닌 '치웅', '보스' 엔진 기준으로 집계)
+    int engine1Wins = 0, engine2Wins = 0, draws = 0;
 
     for (int iter = 1; iter <= ITERATIONS; iter++) {
+        // [수정 포인트 3] 판수의 절반이 넘어가면 흑/백 진영을 자동으로 맞바꿈
+        if (iter == (ITERATIONS / 2) + 1) {
+            swap(current_p1, current_p2);
+            cout << "\n🔄 [진영 자동 교체] " << iter << "번째 판부터 흑/백 진영이 교체됩니다!\n";
+            cout << "-> P1 (흑●): " << getEngineName(current_p1) << "\n";
+            cout << "-> P2 (백○): " << getEngineName(current_p2) << "\n\n";
+        }
+
         fill(Chiung::TT_Cache.begin(), Chiung::TT_Cache.end(), Chiung::TTEntry{ 0, -1, 0, Chiung::EXACT });
 #if (MATCH_P1 == ENGINE_BOSS) || (MATCH_P2 == ENGINE_BOSS)
         fill(Boss::TT_Cache.begin(), Boss::TT_Cache.end(), Boss::TTEntry{ 0, -1, 0, Boss::EXACT, Boss::Move() });
@@ -230,7 +228,7 @@ int main() {
 
         if (SHOW_BROADCAST) {
             cout << "\n🎯 === [" << iter << "번째 판 시작] === 🎯\n";
-            printBoard(board);
+            printBoard(board, current_p1, current_p2);
         }
 
         double p1TotalTimeMs = 0.0, p2TotalTimeMs = 0.0;
@@ -243,7 +241,6 @@ int main() {
         long long p1TotalNodesAccum = 0;
         long long p2TotalNodesAccum = 0;
 
-        // [수정 포인트 2] 수집용 변수 선언 및 초기화
         int opening_advantage = 0;
         int score_at_34 = 0;
         int score_at_19 = 0;
@@ -270,11 +267,9 @@ int main() {
                 uint64_t empty = ~(board.p1 | board.p2) & ((1ULL << 49) - 1);
                 if (p1CanMove && !p2CanMove) {
                     board.p1 |= empty;
-                    if (SHOW_BROADCAST) cout << "🧹 [싹쓸이 발동] P2 " << p2Name << " 고립! P1 " << p1Name << "가 빈칸을 복제하며 즉시 승리!\n";
                 }
                 else if (!p1CanMove && p2CanMove) {
                     board.p2 |= empty;
-                    if (SHOW_BROADCAST) cout << "🧹 [싹쓸이 발동] P1 " << p1Name << " 고립! P2 " << p2Name << "가 빈칸을 복제하며 즉시 승리!\n";
                 }
                 break;
             }
@@ -284,13 +279,11 @@ int main() {
             int totalCount = p1Count + p2Count;
             int emptyCount = 49 - totalCount;
 
-            // [수정 포인트 3] 실시간 상황 및 페이즈별 데이터 스냅샷 캡처 (스킵 방지 조건부)
             if (emptyCount <= 35 && !op_rec) { opening_advantage = p1Count - p2Count; op_rec = true; }
             if (emptyCount <= 34 && !m34_rec) { score_at_34 = p1Count - p2Count; m34_rec = true; }
             if (emptyCount <= 19 && !m19_rec) { score_at_19 = p1Count - p2Count; m19_rec = true; }
             if (emptyCount <= 18 && !sol_rec) { solver_efficiency_score = p1Count - p2Count; sol_rec = true; }
 
-            // [수정 포인트 4] 실시간 역전 분수령(Turning Point) 감지 로직
             int current_lead = p1Count - p2Count;
             if (turns > 0 && turning_point_turn == -1) {
                 if ((prev_lead > 0 && current_lead < 0) || (prev_lead < 0 && current_lead > 0)) {
@@ -299,10 +292,13 @@ int main() {
             }
             prev_lead = current_lead;
 
-            // [수정 포인트 5] 치웅 엔진 기준의 최대 유리 점수(Peak Advantage) 역대 최고치 경신 추적
-            int current_eval = Chiung::AtaxxEngine::evaluate(board, 1);
-            if (current_eval > peak_advantage && current_eval < 900000) {
-                peak_advantage = current_eval;
+            // [수정 포인트 4] 현재 P1/P2 진영과 무관하게, 항상 '치웅 엔진(V16)' 시점에서의 Peak Advantage 추적
+            int eval_color = (current_p1 == ENGINE_CHIUNG) ? 1 : (current_p2 == ENGINE_CHIUNG ? 2 : 0);
+            if (eval_color != 0) {
+                int current_eval = Chiung::AtaxxEngine::evaluate(board, eval_color);
+                if (current_eval > peak_advantage && current_eval < 900000) {
+                    peak_advantage = current_eval;
+                }
             }
 
             if (totalCount > 4) {
@@ -316,60 +312,54 @@ int main() {
 
             if (currColor == 1) {
                 long long turnNodes = 0;
-                MoveInfo moveInfo = getP1Move(board, TIME_LIMIT, turnNodes);
+                MoveInfo moveInfo = getEngineMove(current_p1, board, 1, TIME_LIMIT, turnNodes);
 
                 p1TotalTimeMs += moveInfo.timeMs;
                 p1TotalNodesAccum += turnNodes;
                 p1MovesCount++;
 
                 if (moveInfo.to != -1) {
-                    // [수정 포인트 6] P1 행동 로그 분류 카운트
                     if (moveInfo.isClone) p1_clones++; else p1_jumps++;
-
-                    if (SHOW_BROADCAST) {
-                        int r2 = moveInfo.to / 7, c2 = moveInfo.to % 7;
-                        if (moveInfo.isClone) cout << "➡️ ⚡ P1 " << p1Name << ": (" << r2 << ", " << c2 << ") 로 1칸 [복제] 완료!\n";
-                        else cout << "➡️ 🔥 P1 " << p1Name << ": (" << moveInfo.from / 7 << ", " << moveInfo.from % 7 << ") 에서 (" << r2 << ", " << c2 << ") 로 2칸 [점프] 완료!\n";
-                    }
                     Chiung::Move cMove = { moveInfo.from, moveInfo.to, moveInfo.isClone, 0, 0 };
                     board = Chiung::AtaxxEngine::applyMove(board, cMove, 1);
                 }
             }
             else {
                 long long turnNodes = 0;
-                MoveInfo moveInfo = getP2Move(board, TIME_LIMIT, turnNodes);
+                MoveInfo moveInfo = getEngineMove(current_p2, board, 2, TIME_LIMIT, turnNodes);
 
                 p2TotalTimeMs += moveInfo.timeMs;
                 p2TotalNodesAccum += turnNodes;
                 p2MovesCount++;
 
                 if (moveInfo.to != -1) {
-                    // [수정 포인트 6] P2 행동 로그 분류 카운트
                     if (moveInfo.isClone) p2_clones++; else p2_jumps++;
-
-                    if (SHOW_BROADCAST) {
-                        int r2 = moveInfo.to / 7, c2 = moveInfo.to % 7;
-                        if (moveInfo.isClone) cout << "➡️ ⚡ P2 " << p2Name << ": (" << r2 << ", " << c2 << ") 로 1칸 [복제] 완료!\n";
-                        else cout << "➡️ 🔥 P2 " << p2Name << ": (" << moveInfo.from / 7 << ", " << moveInfo.from % 7 << ") 에서 (" << r2 << ", " << c2 << ") 로 2칸 [점프] 완료!\n";
-                    }
                     Chiung::Move cMove = { moveInfo.from, moveInfo.to, moveInfo.isClone, 0, 0 };
                     board = Chiung::AtaxxEngine::applyMove(board, cMove, 2);
                 }
             }
 
-            // [수정 포인트 7] 첫 코너 선점 턴 추적
             if (corner_grab_turn == -1 && ((board.p1 | board.p2) & corner_mask) != 0) {
                 corner_grab_turn = turns;
             }
 
-            if (SHOW_BROADCAST) printBoard(board);
+            if (SHOW_BROADCAST) printBoard(board, current_p1, current_p2);
             turns++;
         }
 
         int winner = board.getWinner();
-        if (winner == 1) p1Wins++;
-        else if (winner == 2) p2Wins++;
-        else draws++;
+        string winning_engine_name = "무승부";
+
+        // [수정 포인트 5] 진영(P1/P2)이 아닌 엔진 기준으로 승률 누적 
+        if (winner == 1) {
+            winning_engine_name = getEngineName(current_p1);
+            if (current_p1 == MATCH_P1) engine1Wins++; else engine2Wins++;
+        }
+        else if (winner == 2) {
+            winning_engine_name = getEngineName(current_p2);
+            if (current_p2 == MATCH_P1) engine1Wins++; else engine2Wins++;
+        }
+        else { draws++; }
 
         double p1AvgTime = (p1MovesCount > 0) ? (p1TotalTimeMs / p1MovesCount) : 0.0;
         double p2AvgTime = (p2MovesCount > 0) ? (p2TotalTimeMs / p2MovesCount) : 0.0;
@@ -377,27 +367,28 @@ int main() {
         long long p1Nps = (p1TotalTimeMs > 0) ? (long long)(p1TotalNodesAccum / (p1TotalTimeMs / 1000.0)) : 0;
         long long p2Nps = (p2TotalTimeMs > 0) ? (long long)(p2TotalNodesAccum / (p2TotalTimeMs / 1000.0)) : 0;
 
-        // 중반 변동성 최종 확정 연산
         midgame_volatility = score_at_19 - score_at_34;
 
-        // [수정 포인트 8] 확장 수집된 모든 전략적 분석 지표를 단 한 칸의 누락 없이 CSV 행으로 출력
-        csv << gameID++ << "," << TIME_LIMIT << "," << winner << "," << lowest_p1_percent << "," << lowest_p2_percent << ","
+        csv << gameID++ << "," << TIME_LIMIT << ","
+            << getEngineName(current_p1) << "," << getEngineName(current_p2) << ","
+            << winner << "," << winning_engine_name << ","
+            << lowest_p1_percent << "," << lowest_p2_percent << ","
             << p1AvgTime << "," << p2AvgTime << "," << p1Nps << "," << p2Nps << "," << turns << ","
             << opening_advantage << "," << midgame_volatility << "," << solver_efficiency_score << ","
             << p1_clones << "," << p1_jumps << "," << p2_clones << "," << p2_jumps << ","
-            << corner_grab_turn << "," << peak_advantage << "," << turning_point_turn << "\n";
+            << corner_grab_turn << "," << peak_advantage << "," << turning_point_turn << endl;
 
         if (!SHOW_BROADCAST && iter % 10 == 0) {
-            cout << "  -> " << iter << "판 완료... [스코어] P1(" << p1Name << "): " << p1Wins << "승 | P2(" << p2Name << "): " << p2Wins << "승 | 무승부: " << draws << "\n";
-        }
-        else if (SHOW_BROADCAST) {
-            cout << "🏁 " << iter << "번째 판 종료! 승자: " << (winner == 1 ? "P1 (" + p1Name + ")" : (winner == 2 ? "P2 (" + p2Name + ")" : "무승부")) << "\n";
+            cout << "  -> " << iter << "판 완료... [누적 스코어] "
+                << getEngineName(MATCH_P1) << ": " << engine1Wins << "승 | "
+                << getEngineName(MATCH_P2) << ": " << engine2Wins << "승 | 무승부: " << draws << "\n";
         }
     }
 
-    cout << "\n🔥 대결 최종 결과 | P1 승: " << p1Wins << " / P2 승: " << p2Wins << " / 무승부: " << draws << "\n\n";
+    cout << "\n🔥 대결 최종 결과 | " << getEngineName(MATCH_P1) << " 승: " << engine1Wins
+        << " / " << getEngineName(MATCH_P2) << " 승: " << engine2Wins << " / 무승부: " << draws << "\n\n";
 
     csv.close();
-    cout << "✅ 모든 분석용 지표가 '" << outFileName << "' 파일에 성공적으로 저장되었습니다.\n";
+    cout << "✅ 모든 자동교체 분석 지표가 '" << outFileName << "' 파일에 성공적으로 저장되었습니다.\n";
     return 0;
 }
