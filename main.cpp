@@ -6,12 +6,14 @@
 
 // =====================================================================
 // 💡 [유니버설 플레이어 설정]
+// 팀원과 코드를 공유할 때, 아래의 숫자만 변경하여 대진표를 만드세요!
 // =====================================================================
 #define ENGINE_CHIUNG 1
 #define ENGINE_TAEWAN 2
 #define ENGINE_BOSS   3
 
 // 👇 처음에 시작할 P1(흑)과 P2(백)를 지정하세요. (절반이 지나면 자동으로 바뀝니다)
+// ※ 분석 지표(CSV)는 항상 이 'MATCH_P1'에 설정된 엔진을 기준으로 정규화됩니다!
 #define MATCH_P1 ENGINE_CHIUNG
 #define MATCH_P2 ENGINE_BOSS
 
@@ -86,7 +88,7 @@ bool checkValidMovesGlobally(const Chiung::Bitboard& b, int color) {
 }
 
 // ---------------------------------------------------------------------
-// [수정 포인트 1] 동적 엔진 호출 래퍼 (런타임 진영 교체를 위함)
+// 동적 엔진 호출 래퍼 (런타임 진영 교체용)
 // ---------------------------------------------------------------------
 struct MoveInfo {
     int from, to;
@@ -123,6 +125,28 @@ MoveInfo getEngineMove(int engineType, const Chiung::Bitboard& b, int color, dou
     }
 #endif
     return { -1, -1, false, 0.0 };
+}
+
+// ---------------------------------------------------------------------
+// 동적 엔진 평가(Evaluate) 래퍼 - 기준 엔진의 가중치로 판세를 평가
+// ---------------------------------------------------------------------
+int getEngineEvaluate(int engineType, const Chiung::Bitboard& b, int color) {
+    if (engineType == ENGINE_CHIUNG) {
+        return Chiung::AtaxxEngine::evaluate(b, color);
+    }
+#if (MATCH_P1 == ENGINE_BOSS) || (MATCH_P2 == ENGINE_BOSS)
+    else if (engineType == ENGINE_BOSS) {
+        return Boss::AtaxxEngine::evaluate(convertToBossBoard(b), color);
+    }
+#endif
+#if (MATCH_P1 == ENGINE_TAEWAN) || (MATCH_P2 == ENGINE_TAEWAN)
+    else if (engineType == ENGINE_TAEWAN) {
+        // 만약 팀원 엔진에 public evaluate 함수가 없다면 아래 줄을 주석 처리하거나 0을 반환하세요.
+        // return Teammate::AtaxxEngine::evaluate(convertToTeammateBoard(b), color);
+        return 0;
+    }
+#endif
+    return 0;
 }
 
 // ---------------------------------------------------------------------
@@ -168,7 +192,10 @@ int main() {
     Teammate::initEngine();
 #endif
 
-    string outFileName = getNextFilename("Metrics_AutoSwap_Analysis", ".csv");
+    string protagName = getEngineName(MATCH_P1); // 기준(주인공) 엔진 이름
+    string oppName = getEngineName(MATCH_P2);    // 적(상대) 엔진 이름
+
+    string outFileName = getNextFilename("Metrics_" + protagName + "_VS_" + oppName + "_Analysis", ".csv");
     ofstream csv(outFileName);
 
     if (!csv.is_open()) {
@@ -180,22 +207,24 @@ int main() {
         return 1;
     }
 
-    // [수정 포인트 2] P1, P2 엔진 이름을 명시하는 컬럼 추가 (데이터 피벗 분석을 위함)
-    csv << "게임번호,시간제한(초),P1_엔진(흑),P2_엔진(백),승리_진영,승리_엔진,"
-        << "P1_최저점유율_%,P2_최저점유율_%,"
-        << "P1_평균시간_ms,P2_평균시간_ms,"
-        << "P1_NPS,P2_NPS,총턴수,"
-        << "Opening_Advantage,Midgame_Volatility,Solver_Efficiency_Score,"
-        << "P1_Clone_Count,P1_Jump_Count,P2_Clone_Count,P2_Jump_Count,"
-        << "Corner_Grab_Turn,Chiung_Peak_Advantage,Turning_Point\n";
+    // MATCH_P1을 기준으로 한 완벽한 범용 CSV 헤더 출력
+    csv << "게임번호,시간제한(초),흑_엔진,백_엔진,승리_진영,기준엔진(" << protagName << ")_현재진영,기준엔진_승패결과,"
+        << "기준_최저점유율_%,적_최저점유율_%,"
+        << "기준_평균시간_ms,적_평균시간_ms,"
+        << "기준_NPS,적_NPS,총턴수,"
+        << "기준_Opening_Adv,기준_Midgame_Vol,기준_Solver_Eff,"
+        << "기준_Clone수,기준_Jump수,적_Clone수,적_Jump수,"
+        << "첫_코너점령_턴수,기준_Peak_Advantage,역전발생_턴수\n";
 
     int current_p1 = MATCH_P1;
     int current_p2 = MATCH_P2;
 
     cout << "=========================================================\n";
-    cout << " 🚀 유니버설 AI 자동 진영교체(Swap) 시뮬레이터\n";
+    cout << " 🚀 유니버설 AI 전략 프로파일링 (범용 기준엔진 정규화)\n";
     cout << "=========================================================\n";
-    cout << "💾 저장될 파일명: " << outFileName << "\n\n";
+    cout << "- 기준 엔진 (주인공): " << protagName << " (현재 MATCH_P1)\n";
+    cout << "- 대결 엔진 (상대방): " << oppName << " (현재 MATCH_P2)\n";
+    cout << "💾 저장될 파일명: " << outFileName << " (폴더 확인 필수!)\n\n";
 
     int gameID = 1;
     const int ITERATIONS = 200;
@@ -203,11 +232,9 @@ int main() {
 
     cout << "[제한시간 " << TIME_LIMIT << "초] " << ITERATIONS << "판 시뮬레이션 진행 중...\n";
 
-    // 누적 승수 트래커 (P1/P2 기준이 아닌 '치웅', '보스' 엔진 기준으로 집계)
     int engine1Wins = 0, engine2Wins = 0, draws = 0;
 
     for (int iter = 1; iter <= ITERATIONS; iter++) {
-        // [수정 포인트 3] 판수의 절반이 넘어가면 흑/백 진영을 자동으로 맞바꿈
         if (iter == (ITERATIONS / 2) + 1) {
             swap(current_p1, current_p2);
             cout << "\n🔄 [진영 자동 교체] " << iter << "번째 판부터 흑/백 진영이 교체됩니다!\n";
@@ -265,12 +292,8 @@ int main() {
 
             if (!p1CanMove || !p2CanMove) {
                 uint64_t empty = ~(board.p1 | board.p2) & ((1ULL << 49) - 1);
-                if (p1CanMove && !p2CanMove) {
-                    board.p1 |= empty;
-                }
-                else if (!p1CanMove && p2CanMove) {
-                    board.p2 |= empty;
-                }
+                if (p1CanMove && !p2CanMove) board.p1 |= empty;
+                else if (!p1CanMove && p2CanMove) board.p2 |= empty;
                 break;
             }
 
@@ -292,10 +315,10 @@ int main() {
             }
             prev_lead = current_lead;
 
-            // [수정 포인트 4] 현재 P1/P2 진영과 무관하게, 항상 '치웅 엔진(V16)' 시점에서의 Peak Advantage 추적
-            int eval_color = (current_p1 == ENGINE_CHIUNG) ? 1 : (current_p2 == ENGINE_CHIUNG ? 2 : 0);
+            // 기준 엔진(MATCH_P1)의 관점에서 현재 보드의 Peak Advantage 갱신
+            int eval_color = (current_p1 == MATCH_P1) ? 1 : (current_p2 == MATCH_P1 ? 2 : 0);
             if (eval_color != 0) {
-                int current_eval = Chiung::AtaxxEngine::evaluate(board, eval_color);
+                int current_eval = getEngineEvaluate(MATCH_P1, board, eval_color);
                 if (current_eval > peak_advantage && current_eval < 900000) {
                     peak_advantage = current_eval;
                 }
@@ -348,15 +371,11 @@ int main() {
         }
 
         int winner = board.getWinner();
-        string winning_engine_name = "무승부";
 
-        // [수정 포인트 5] 진영(P1/P2)이 아닌 엔진 기준으로 승률 누적 
         if (winner == 1) {
-            winning_engine_name = getEngineName(current_p1);
             if (current_p1 == MATCH_P1) engine1Wins++; else engine2Wins++;
         }
         else if (winner == 2) {
-            winning_engine_name = getEngineName(current_p2);
             if (current_p2 == MATCH_P1) engine1Wins++; else engine2Wins++;
         }
         else { draws++; }
@@ -369,13 +388,42 @@ int main() {
 
         midgame_volatility = score_at_19 - score_at_34;
 
+        // MATCH_P1에 할당된 엔진을 '기준(프로타고니스트)'으로 삼아 모든 데이터를 재매핑
+        bool isProtagBlack = (current_p1 == MATCH_P1);
+
+        string protag_side_str = isProtagBlack ? "흑" : "백";
+        string win_side_str = (winner == 1) ? "흑" : (winner == 2 ? "백" : "무승부");
+        string protag_result = "무";
+        if (winner == 1) protag_result = isProtagBlack ? "승" : "패";
+        else if (winner == 2) protag_result = !isProtagBlack ? "승" : "패";
+
+        double protag_lowest_pct = isProtagBlack ? lowest_p1_percent : lowest_p2_percent;
+        double opp_lowest_pct = isProtagBlack ? lowest_p2_percent : lowest_p1_percent;
+
+        double protag_time = isProtagBlack ? p1AvgTime : p2AvgTime;
+        double opp_time = isProtagBlack ? p2AvgTime : p1AvgTime;
+
+        long long protag_nps = isProtagBlack ? p1Nps : p2Nps;
+        long long opp_nps = isProtagBlack ? p2Nps : p1Nps;
+
+        // 점수 차이는 (흑-백) 이었으므로, 기준 엔진이 백이면 부호를 반전(-)시켜 기준 엔진의 관점으로 통일
+        int protag_op_adv = isProtagBlack ? opening_advantage : -opening_advantage;
+        int protag_mid_vol = isProtagBlack ? midgame_volatility : -midgame_volatility;
+        int protag_sol_eff = isProtagBlack ? solver_efficiency_score : -solver_efficiency_score;
+
+        int protag_clones = isProtagBlack ? p1_clones : p2_clones;
+        int protag_jumps = isProtagBlack ? p1_jumps : p2_jumps;
+        int opp_clones = isProtagBlack ? p2_clones : p1_clones;
+        int opp_jumps = isProtagBlack ? p2_jumps : p1_jumps;
+
         csv << gameID++ << "," << TIME_LIMIT << ","
             << getEngineName(current_p1) << "," << getEngineName(current_p2) << ","
-            << winner << "," << winning_engine_name << ","
-            << lowest_p1_percent << "," << lowest_p2_percent << ","
-            << p1AvgTime << "," << p2AvgTime << "," << p1Nps << "," << p2Nps << "," << turns << ","
-            << opening_advantage << "," << midgame_volatility << "," << solver_efficiency_score << ","
-            << p1_clones << "," << p1_jumps << "," << p2_clones << "," << p2_jumps << ","
+            << win_side_str << "," << protag_side_str << "," << protag_result << ","
+            << protag_lowest_pct << "," << opp_lowest_pct << ","
+            << protag_time << "," << opp_time << ","
+            << protag_nps << "," << opp_nps << "," << turns << ","
+            << protag_op_adv << "," << protag_mid_vol << "," << protag_sol_eff << ","
+            << protag_clones << "," << protag_jumps << "," << opp_clones << "," << opp_jumps << ","
             << corner_grab_turn << "," << peak_advantage << "," << turning_point_turn << endl;
 
         if (!SHOW_BROADCAST && iter % 10 == 0) {
@@ -389,6 +437,6 @@ int main() {
         << " / " << getEngineName(MATCH_P2) << " 승: " << engine2Wins << " / 무승부: " << draws << "\n\n";
 
     csv.close();
-    cout << "✅ 모든 자동교체 분석 지표가 '" << outFileName << "' 파일에 성공적으로 저장되었습니다.\n";
+    cout << "✅ 기준 엔진(" << protagName << ") 중심의 정규화 지표가 '" << outFileName << "' 파일에 성공적으로 저장되었습니다.\n";
     return 0;
 }
