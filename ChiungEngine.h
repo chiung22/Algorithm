@@ -46,6 +46,7 @@ namespace Chiung {
 
     const int INF = 1000000;
     const int TT_SIZE = 1048576;
+    const int TT_LOCKS = 4096; // [수정 1] 4096개의 분할 자물쇠 개수 설정
 
     inline static uint64_t ADJ_MASK[49];
     inline static uint64_t JUMP_MASK[49];
@@ -67,7 +68,11 @@ namespace Chiung {
     };
 
     inline static vector<TTEntry> TT_Cache(TT_SIZE);
-    inline static mutex ttMutex;
+
+    // [수정 2] 단일 ttMutex를 파괴하고 4096개의 구조체 배열 락으로 분할 생성
+    struct MutexWrapper { std::mutex m; };
+    inline static MutexWrapper ttMutexes[TT_LOCKS];
+
     inline static atomic<bool> searchCancelled{ false };
 
     struct Bitboard {
@@ -129,8 +134,7 @@ namespace Chiung {
 
             int pScore = myCount - oppCount;
 
-            // [수정 1] 보스 V2(17칸)를 선제 타격하기 위한 '18칸 솔버' 조기 발동
-            if (emptyCount <= 18) {
+            if (emptyCount <= 17) {
                 return pScore * 10000;
             }
 
@@ -177,14 +181,15 @@ namespace Chiung {
 
             int alphaOrig = alpha;
             int ttIndex = (int)(b.hashKey & (TT_SIZE - 1));
+            int lockIndex = ttIndex & (TT_LOCKS - 1); // [수정 3] 해시 인덱스에 매칭되는 독립적인 락 인덱스 계산
 
             Move ttBestMove;
             bool hasTtMove = false;
 
             {
-                lock_guard<mutex> lock(ttMutex);
+                // [수정 4] 전체 잠금이 아닌 4096분의 1 구역만 잠금 (병목 완벽 해소)
+                lock_guard<mutex> lock(ttMutexes[lockIndex].m);
                 TTEntry& tte = TT_Cache[ttIndex];
-                ttLookups.fetch_add(1, memory_order_relaxed);
 
                 if (tte.hash == b.hashKey) {
                     if (tte.bestMove.to != -1) {
@@ -192,7 +197,6 @@ namespace Chiung {
                         hasTtMove = true;
                     }
                     if (tte.depth >= depth) {
-                        ttHits.fetch_add(1, memory_order_relaxed);
                         if (tte.flag == EXACT) return tte.value;
                         if (tte.flag == LOWERBOUND) alpha = max(alpha, tte.value);
                         if (tte.flag == UPPERBOUND) beta = min(beta, tte.value);
@@ -256,7 +260,7 @@ namespace Chiung {
             }
 
             {
-                lock_guard<mutex> lock(ttMutex);
+                lock_guard<mutex> lock(ttMutexes[lockIndex].m);
                 TTEntry& tte = TT_Cache[ttIndex];
                 tte.hash = b.hashKey; tte.depth = depth; tte.value = best; tte.bestMove = currentBestMove;
                 if (best <= alphaOrig) tte.flag = UPPERBOUND;
@@ -272,6 +276,10 @@ namespace Chiung {
             uint64_t opp = (color == PLAYER1) ? b.p2 : b.p1;
             uint64_t empty = ~(b.p1 | b.p2) & FULL_BOARD_MASK;
 
+            uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
+            uint64_t danger = (1ULL << 1) | (1ULL << 5) | (1ULL << 7) | (1ULL << 8) | (1ULL << 12) | (1ULL << 13) |
+                (1ULL << 35) | (1ULL << 36) | (1ULL << 40) | (1ULL << 41) | (1ULL << 43) | (1ULL << 47);
+
             uint64_t temp = my;
             while (temp) {
                 int from = ctz64(temp);
@@ -280,9 +288,10 @@ namespace Chiung {
                     int to = ctz64(clones);
                     int caps = popcount64(ADJ_MASK[to] & opp);
 
-                    int orderScore = 0;
-                    if (caps > 0) orderScore = 3000 + caps * 100;
-                    else orderScore = 1000;
+                    // [수정 5] 코너 선점과 위험구역 회피를 탐색 "최우선 순위"에 강제 주입
+                    int orderScore = (caps > 0) ? (3000 + caps * 100) : 1000;
+                    if ((1ULL << to) & corners) orderScore += 500;
+                    if ((1ULL << to) & danger) orderScore -= 300;
 
                     moves.push_back({ from, to, true, caps, orderScore });
                     clones &= clones - 1;
@@ -298,9 +307,10 @@ namespace Chiung {
                     int to = ctz64(jumps);
                     int caps = popcount64(ADJ_MASK[to] & opp);
 
-                    int orderScore = 0;
-                    if (caps > 0) orderScore = 2000 + caps * 100;
-                    else orderScore = 0;
+                    // [수정 5] 점프 이동 시에도 코너 및 위험구역 최우선 정렬
+                    int orderScore = (caps > 0) ? (2000 + caps * 100) : 0;
+                    if ((1ULL << to) & corners) orderScore += 500;
+                    if ((1ULL << to) & danger) orderScore -= 300;
 
                     moves.push_back({ from, to, false, caps, orderScore });
                     jumps &= jumps - 1;
@@ -331,34 +341,6 @@ namespace Chiung {
             }
             b.hashKey ^= ZOBRIST_TURN;
             return b;
-        }
-
-        static Move getBestMoveFixedDepth(const Bitboard& board, int myColor, int targetDepth) {
-            searchCancelled = false;
-            totalGameNodes = 0; ttHits = 0; ttLookups = 0;
-
-            vector<Move> validMoves = getValidMoves(board, myColor);
-            if (validMoves.empty()) return { -1, -1, false, 0, 0 };
-
-            Move globalBestMove = validMoves[0];
-
-            for (int currentDepth = 1; currentDepth <= targetDepth; currentDepth++) {
-                Move depthBestMove = globalBestMove;
-                int bestScore = -INF;
-
-                auto it = find_if(validMoves.begin(), validMoves.end(), [&](const Move& m) {
-                    return m.from == globalBestMove.from && m.to == globalBestMove.to && m.isClone == globalBestMove.isClone;
-                    });
-                if (it != validMoves.end() && it != validMoves.begin()) iter_swap(validMoves.begin(), it);
-
-                for (const Move& m : validMoves) {
-                    Bitboard nextB = applyMove(board, m, myColor);
-                    int score = pvs(nextB, currentDepth - 1, -INF, INF, false, myColor);
-                    if (score > bestScore) { bestScore = score; depthBestMove = m; }
-                }
-                globalBestMove = depthBestMove;
-            }
-            return globalBestMove;
         }
 
         static Move getBestMoveTimeLimited(const Bitboard& b, int myColor, double timeLimitSeconds) {
@@ -396,14 +378,13 @@ namespace Chiung {
                             iter_swap(threadMoves.begin(), it);
                         }
 
-                        // [수정 2] 최상단(Root) 노드부터 PVS(Null Window)를 돌리기 위한 플래그 추가
+                        // 최상단 루트 PVS 가동
                         bool rootFirst = true;
 
                         for (const Move& m : threadMoves) {
                             Bitboard nextB = applyMove(b, m, myColor);
                             int eval = 0;
 
-                            // 루트 노드 PVS 적용: 1순위 수는 전체 창, 나머지는 닫힌 창으로 가지치기
                             if (rootFirst) {
                                 eval = pvs(nextB, depth - 1, alpha, beta, false, myColor);
                                 rootFirst = false;
