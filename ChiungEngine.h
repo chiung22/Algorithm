@@ -46,7 +46,7 @@ namespace Chiung {
 
     const int INF = 1000000;
     const int TT_SIZE = 1048576;
-    const int TT_LOCKS = 4096; // [수정 1] 4096개의 분할 자물쇠 개수 설정
+    const int TT_LOCKS = 4096;
 
     inline static uint64_t ADJ_MASK[49];
     inline static uint64_t JUMP_MASK[49];
@@ -69,7 +69,6 @@ namespace Chiung {
 
     inline static vector<TTEntry> TT_Cache(TT_SIZE);
 
-    // [수정 2] 단일 ttMutex를 파괴하고 4096개의 구조체 배열 락으로 분할 생성
     struct MutexWrapper { std::mutex m; };
     inline static MutexWrapper ttMutexes[TT_LOCKS];
 
@@ -142,6 +141,7 @@ namespace Chiung {
             uint64_t temp = my;
             while (temp) {
                 int idx = ctz64(temp);
+                // 밀집도(Density) 계산: 내 돌 주변에 내 돌이 얼마나 많은가
                 myDensity += popcount64(ADJ_MASK[idx] & my);
                 myMobility += popcount64((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty);
                 temp &= temp - 1;
@@ -151,12 +151,16 @@ namespace Chiung {
             temp = opp;
             while (temp) {
                 int idx = ctz64(temp);
+                // 상대방 밀집도 계산
                 oppDensity += popcount64(ADJ_MASK[idx] & opp);
                 oppMobility += popcount64((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty);
                 temp &= temp - 1;
             }
 
             int mDiff = myMobility - oppMobility;
+
+            // [V18 튜닝 핵심 1] 잃어버렸던 '밀집도(Density)' 격차 부활
+            int dDiff = myDensity - oppDensity;
 
             uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
             int cDiff = popcount64(my & corners) - popcount64(opp & corners);
@@ -168,10 +172,26 @@ namespace Chiung {
             uint64_t center = 0x10E070000ULL;
             int centerDiff = popcount64(my & center) - popcount64(opp & center);
 
+            // [V18 튜닝 핵심 2] 페이즈별 연속 보간 (그라데이션 가중치)
+            int dynamicDangerPenalty = 100; // 기본은 극강의 위험구역 회피
+            if (emptyCount > 35) {
+                dynamicDangerPenalty = 20; // 극초반: 중앙 장악을 위해 패널티 최소화
+            }
+            else if (emptyCount > 20) {
+                // 중반: 빈칸이 줄어들수록 위험 패널티가 20에서 95까지 부드럽게 상승
+                dynamicDangerPenalty = 95 - (emptyCount - 20) * 3;
+            }
+
+            int dynamicCenterBonus = 0;
+            if (emptyCount > 30) dynamicCenterBonus = 30;
+            else if (emptyCount > 15) dynamicCenterBonus = 10;
+
             int mWeight = emptyCount * 3;
+            int dWeight = 10; // 밀집도 가중치: 돌 하나당 +10점의 결속력 부여
             int pWeight = 50 + (49 - emptyCount) * 5;
 
-            return pScore * pWeight + mDiff * mWeight + cDiff * 350 + dangerDiff * 95 + centerDiff * 10;
+            // 최종 리턴에 밀집도(dDiff * dWeight) 합산!
+            return pScore * pWeight + mDiff * mWeight + dDiff * dWeight + cDiff * 350 + dangerDiff * dynamicDangerPenalty + centerDiff * dynamicCenterBonus;
         }
 
         static int pvs(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor) {
@@ -181,13 +201,12 @@ namespace Chiung {
 
             int alphaOrig = alpha;
             int ttIndex = (int)(b.hashKey & (TT_SIZE - 1));
-            int lockIndex = ttIndex & (TT_LOCKS - 1); // [수정 3] 해시 인덱스에 매칭되는 독립적인 락 인덱스 계산
+            int lockIndex = ttIndex & (TT_LOCKS - 1);
 
             Move ttBestMove;
             bool hasTtMove = false;
 
             {
-                // [수정 4] 전체 잠금이 아닌 4096분의 1 구역만 잠금 (병목 완벽 해소)
                 lock_guard<mutex> lock(ttMutexes[lockIndex].m);
                 TTEntry& tte = TT_Cache[ttIndex];
 
@@ -222,27 +241,29 @@ namespace Chiung {
             int best = isMax ? -INF : INF;
             Move currentBestMove = moves[0];
             bool firstMove = true;
+            int moveIndex = 0;
 
             for (auto& m : moves) {
                 Bitboard nextB = applyMove(b, m, currColor);
                 int val = 0;
+
+                int R = 0;
+                if (depth >= 3 && moveIndex >= 4 && m.infectCount == 0 && !m.isClone) {
+                    R = 1;
+                }
 
                 if (firstMove) {
                     val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
                     firstMove = false;
                 }
                 else {
-                    if (isMax) {
+                    val = pvs(nextB, depth - 1 - R, alpha, alpha + 1, !isMax, myColor);
+
+                    if (val > alpha && R > 0) {
                         val = pvs(nextB, depth - 1, alpha, alpha + 1, !isMax, myColor);
-                        if (val > alpha && val < beta) {
-                            val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
-                        }
                     }
-                    else {
-                        val = pvs(nextB, depth - 1, beta - 1, beta, !isMax, myColor);
-                        if (val < beta && val > alpha) {
-                            val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
-                        }
+                    if (val > alpha && val < beta) {
+                        val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
                     }
                 }
 
@@ -256,6 +277,7 @@ namespace Chiung {
                     if (val < best) { best = val; currentBestMove = m; }
                     beta = min(beta, best);
                 }
+                moveIndex++;
                 if (beta <= alpha) break;
             }
 
@@ -288,10 +310,12 @@ namespace Chiung {
                     int to = ctz64(clones);
                     int caps = popcount64(ADJ_MASK[to] & opp);
 
-                    // [수정 5] 코너 선점과 위험구역 회피를 탐색 "최우선 순위"에 강제 주입
                     int orderScore = (caps > 0) ? (3000 + caps * 100) : 1000;
                     if ((1ULL << to) & corners) orderScore += 500;
                     if ((1ULL << to) & danger) orderScore -= 300;
+
+                    // 복제(Clone)시 단단한 진형 구축을 위한 정렬 보너스
+                    orderScore += 300;
 
                     moves.push_back({ from, to, true, caps, orderScore });
                     clones &= clones - 1;
@@ -307,7 +331,6 @@ namespace Chiung {
                     int to = ctz64(jumps);
                     int caps = popcount64(ADJ_MASK[to] & opp);
 
-                    // [수정 5] 점프 이동 시에도 코너 및 위험구역 최우선 정렬
                     int orderScore = (caps > 0) ? (2000 + caps * 100) : 0;
                     if ((1ULL << to) & corners) orderScore += 500;
                     if ((1ULL << to) & danger) orderScore -= 300;
@@ -368,9 +391,17 @@ namespace Chiung {
                     }
 
                     Move localBestMove = threadMoves[0];
+                    int prevScore = 0;
 
                     for (int depth = 1; depth <= 100; depth++) {
-                        int maxEval = -INF, alpha = -INF, beta = INF;
+
+                        int alpha = -INF, beta = INF;
+                        if (depth > 2) {
+                            alpha = prevScore - 400;
+                            beta = prevScore + 400;
+                        }
+
+                        int maxEval = -INF;
                         Move depthBestMove = threadMoves[0];
 
                         auto it = find(threadMoves.begin(), threadMoves.end(), localBestMove);
@@ -378,7 +409,6 @@ namespace Chiung {
                             iter_swap(threadMoves.begin(), it);
                         }
 
-                        // 최상단 루트 PVS 가동
                         bool rootFirst = true;
 
                         for (const Move& m : threadMoves) {
@@ -398,12 +428,17 @@ namespace Chiung {
 
                             if (searchCancelled) break;
 
+                            if (eval <= alpha || eval >= beta) {
+                                eval = pvs(nextB, depth - 1, -INF, INF, false, myColor);
+                            }
+
                             if (eval > maxEval) { maxEval = eval; depthBestMove = m; }
                             alpha = max(alpha, eval);
                         }
 
                         if (searchCancelled) break;
                         localBestMove = depthBestMove;
+                        prevScore = maxEval;
 
                         lock_guard<mutex> lock(bestMoveMutex);
                         if (depth > highestReachedDepth || (t == 0 && depth == highestReachedDepth)) {
