@@ -9,6 +9,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <cstring>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -68,11 +69,15 @@ namespace Chiung {
     };
 
     inline static vector<TTEntry> TT_Cache(TT_SIZE);
-
     struct MutexWrapper { std::mutex m; };
     inline static MutexWrapper ttMutexes[TT_LOCKS];
 
     inline static atomic<bool> searchCancelled{ false };
+    inline static int historyTable[3][49][49];
+    inline static Move killerMoves[128][2];
+
+    inline static atomic<bool> stopPonder{ false };
+    inline static vector<thread> ponderWorkers;
 
     struct Bitboard {
         uint64_t p1 = 0, p2 = 0, hashKey = 0;
@@ -97,12 +102,13 @@ namespace Chiung {
     class AtaxxEngine {
     public:
         inline static atomic<long long> totalGameNodes{ 0 };
-        inline static atomic<long long> ttHits{ 0 };
-        inline static atomic<long long> ttLookups{ 0 };
-
         inline static Move bestMoveOverall;
         inline static int highestReachedDepth = 0;
         inline static mutex bestMoveMutex;
+
+        inline static const int W_ORDER_BONUS = 300;
+        inline static const int W_DANGER_MULT = 80;
+        inline static const int W_CENTER_MAX = 20;
 
         static bool hasValidMoves(const Bitboard& b, int color) {
             uint64_t my = (color == PLAYER1) ? b.p1 : b.p2;
@@ -127,94 +133,62 @@ namespace Chiung {
 
             if (oppCount == 0) return INF;
             if (myCount == 0) return -INF;
-
             if (!hasValidMoves(b, (myColor == PLAYER1 ? PLAYER2 : PLAYER1))) return INF;
             if (!hasValidMoves(b, myColor)) return -INF;
 
             int pScore = myCount - oppCount;
+            if (emptyCount <= 17) return pScore * 100000;
 
-            if (emptyCount <= 17) {
-                return pScore * 10000;
-            }
-
-            int myMobility = 0, myDensity = 0;
+            int myMobility = 0, oppMobility = 0;
             uint64_t temp = my;
             while (temp) {
                 int idx = ctz64(temp);
-                // 밀집도(Density) 계산: 내 돌 주변에 내 돌이 얼마나 많은가
-                myDensity += popcount64(ADJ_MASK[idx] & my);
                 myMobility += popcount64((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty);
                 temp &= temp - 1;
             }
-
-            int oppMobility = 0, oppDensity = 0;
             temp = opp;
             while (temp) {
                 int idx = ctz64(temp);
-                // 상대방 밀집도 계산
-                oppDensity += popcount64(ADJ_MASK[idx] & opp);
                 oppMobility += popcount64((ADJ_MASK[idx] | JUMP_MASK[idx]) & empty);
                 temp &= temp - 1;
             }
 
             int mDiff = myMobility - oppMobility;
-
-            // [V18 튜닝 핵심 1] 잃어버렸던 '밀집도(Density)' 격차 부활
-            int dDiff = myDensity - oppDensity;
-
             uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
             int cDiff = popcount64(my & corners) - popcount64(opp & corners);
 
             uint64_t danger = (1ULL << 1) | (1ULL << 5) | (1ULL << 7) | (1ULL << 8) | (1ULL << 12) | (1ULL << 13) |
                 (1ULL << 35) | (1ULL << 36) | (1ULL << 40) | (1ULL << 41) | (1ULL << 43) | (1ULL << 47);
             int dangerDiff = popcount64(opp & danger) - popcount64(my & danger);
-
             uint64_t center = 0x10E070000ULL;
             int centerDiff = popcount64(my & center) - popcount64(opp & center);
 
-            // [V18 튜닝 핵심 2] 페이즈별 연속 보간 (그라데이션 가중치)
-            int dynamicDangerPenalty = 100; // 기본은 극강의 위험구역 회피
-            if (emptyCount > 35) {
-                dynamicDangerPenalty = 20; // 극초반: 중앙 장악을 위해 패널티 최소화
-            }
-            else if (emptyCount > 20) {
-                // 중반: 빈칸이 줄어들수록 위험 패널티가 20에서 95까지 부드럽게 상승
-                dynamicDangerPenalty = 95 - (emptyCount - 20) * 3;
-            }
+            double phase = (double)(49 - emptyCount) / 49.0;
+            int dynamicDangerPenalty = 20 + (int)(phase * W_DANGER_MULT);
+            int dynamicCenterBonus = (emptyCount > 38) ? W_CENTER_MAX : ((emptyCount > 15) ? 10 : 0);
 
-            int dynamicCenterBonus = 0;
-            if (emptyCount > 30) dynamicCenterBonus = 30;
-            else if (emptyCount > 15) dynamicCenterBonus = 10;
-
-            int mWeight = emptyCount * 3;
-            int dWeight = 10; // 밀집도 가중치: 돌 하나당 +10점의 결속력 부여
+            int mWeight = (emptyCount * emptyCount) / 10;
+            int cWeight = 350 + (emptyCount <= 20 ? (20 - emptyCount) * 15 : 0);
             int pWeight = 50 + (49 - emptyCount) * 5;
 
-            // 최종 리턴에 밀집도(dDiff * dWeight) 합산!
-            return pScore * pWeight + mDiff * mWeight + dDiff * dWeight + cDiff * 350 + dangerDiff * dynamicDangerPenalty + centerDiff * dynamicCenterBonus;
+            return pScore * pWeight + mDiff * mWeight + cDiff * cWeight + dangerDiff * dynamicDangerPenalty + centerDiff * dynamicCenterBonus;
         }
 
-        static int pvs(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor) {
+        static int pvs(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor, bool isNullMoveAllowed) {
             if (searchCancelled) return 0;
-
             totalGameNodes.fetch_add(1, memory_order_relaxed);
 
             int alphaOrig = alpha;
             int ttIndex = (int)(b.hashKey & (TT_SIZE - 1));
             int lockIndex = ttIndex & (TT_LOCKS - 1);
-
             Move ttBestMove;
             bool hasTtMove = false;
 
             {
                 lock_guard<mutex> lock(ttMutexes[lockIndex].m);
                 TTEntry& tte = TT_Cache[ttIndex];
-
                 if (tte.hash == b.hashKey) {
-                    if (tte.bestMove.to != -1) {
-                        ttBestMove = tte.bestMove;
-                        hasTtMove = true;
-                    }
+                    if (tte.bestMove.to != -1) { ttBestMove = tte.bestMove; hasTtMove = true; }
                     if (tte.depth >= depth) {
                         if (tte.flag == EXACT) return tte.value;
                         if (tte.flag == LOWERBOUND) alpha = max(alpha, tte.value);
@@ -224,75 +198,147 @@ namespace Chiung {
                 }
             }
 
-            if (depth == 0 || b.isGameOver()) return evaluate(b, myColor);
-
+            if (depth <= 0 || b.isGameOver()) return evaluate(b, myColor);
             int currColor = isMax ? myColor : (myColor == PLAYER1 ? PLAYER2 : PLAYER1);
-            vector<Move> moves = getValidMoves(b, currColor);
 
+            if (!isMax && depth <= 3 && !hasTtMove) {
+                int staticEval = evaluate(b, myColor);
+                int margin = 120 * depth;
+                if (staticEval - margin >= beta) return staticEval - margin;
+            }
+
+            if (isNullMoveAllowed && depth >= 3 && !hasValidMoves(b, currColor) == false) {
+                Bitboard nullBoard = b; nullBoard.hashKey ^= ZOBRIST_TURN;
+                int nullVal = pvs(nullBoard, depth - 1 - 2, alpha, beta, !isMax, myColor, false);
+                if (nullVal >= beta) return beta;
+            }
+
+            vector<Move> moves = getValidMoves(b, currColor, depth);
             if (moves.empty()) return evaluate(b, myColor);
 
             if (hasTtMove) {
                 auto it = find(moves.begin(), moves.end(), ttBestMove);
-                if (it != moves.end() && it != moves.begin()) {
-                    iter_swap(moves.begin(), it);
-                }
+                if (it != moves.end() && it != moves.begin()) iter_swap(moves.begin(), it);
             }
 
             int best = isMax ? -INF : INF;
             Move currentBestMove = moves[0];
             bool firstMove = true;
-            int moveIndex = 0;
+            int movesSearched = 0;
 
             for (auto& m : moves) {
                 Bitboard nextB = applyMove(b, m, currColor);
                 int val = 0;
-
-                int R = 0;
-                if (depth >= 3 && moveIndex >= 4 && m.infectCount == 0 && !m.isClone) {
-                    R = 1;
-                }
+                bool isCapture = m.infectCount > 0;
+                bool isKiller = (m == killerMoves[depth][0] || m == killerMoves[depth][1]);
+                int reduction = (depth >= 3 && movesSearched >= 3 && !isCapture && !isKiller && !m.isClone) ? ((movesSearched > 6) ? 2 : 1) : 0;
 
                 if (firstMove) {
-                    val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
+                    val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor, true);
                     firstMove = false;
                 }
                 else {
-                    val = pvs(nextB, depth - 1 - R, alpha, alpha + 1, !isMax, myColor);
-
-                    if (val > alpha && R > 0) {
-                        val = pvs(nextB, depth - 1, alpha, alpha + 1, !isMax, myColor);
-                    }
-                    if (val > alpha && val < beta) {
-                        val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor);
-                    }
+                    val = pvs(nextB, depth - 1 - reduction, alpha, alpha + 1, !isMax, myColor, true);
+                    if (val > alpha && reduction > 0) val = pvs(nextB, depth - 1, alpha, alpha + 1, !isMax, myColor, true);
+                    if (val > alpha && val < beta) val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor, true);
                 }
 
                 if (searchCancelled) return 0;
 
-                if (isMax) {
-                    if (val > best) { best = val; currentBestMove = m; }
-                    alpha = max(alpha, best);
+                if (isMax) { if (val > best) { best = val; currentBestMove = m; } alpha = max(alpha, best); }
+                else { if (val < best) { best = val; currentBestMove = m; } beta = min(beta, best); }
+
+                movesSearched++;
+                if (beta <= alpha) {
+                    if (m.infectCount == 0) {
+                        historyTable[currColor][m.from][m.to] += depth * depth;
+                        if (!(m == killerMoves[depth][0])) { killerMoves[depth][1] = killerMoves[depth][0]; killerMoves[depth][0] = m; }
+                    }
+                    break;
                 }
-                else {
-                    if (val < best) { best = val; currentBestMove = m; }
-                    beta = min(beta, best);
-                }
-                moveIndex++;
-                if (beta <= alpha) break;
             }
 
             {
                 lock_guard<mutex> lock(ttMutexes[lockIndex].m);
                 TTEntry& tte = TT_Cache[ttIndex];
                 tte.hash = b.hashKey; tte.depth = depth; tte.value = best; tte.bestMove = currentBestMove;
-                if (best <= alphaOrig) tte.flag = UPPERBOUND;
-                else if (best >= beta) tte.flag = LOWERBOUND;
-                else tte.flag = EXACT;
+                if (best <= alphaOrig) tte.flag = UPPERBOUND; else if (best >= beta) tte.flag = LOWERBOUND; else tte.flag = EXACT;
             }
             return best;
         }
 
-        static vector<Move> getValidMoves(const Bitboard& b, int color) {
+        static int pvsPonder(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor, bool isNullMoveAllowed) {
+            if (stopPonder) return 0;
+
+            int alphaOrig = alpha;
+            int ttIndex = (int)(b.hashKey & (TT_SIZE - 1));
+            int lockIndex = ttIndex & (TT_LOCKS - 1);
+            Move ttBestMove;
+            bool hasTtMove = false;
+
+            {
+                lock_guard<mutex> lock(ttMutexes[lockIndex].m);
+                TTEntry& tte = TT_Cache[ttIndex];
+                if (tte.hash == b.hashKey) {
+                    if (tte.bestMove.to != -1) { ttBestMove = tte.bestMove; hasTtMove = true; }
+                    if (tte.depth >= depth) {
+                        if (tte.flag == EXACT) return tte.value;
+                        if (tte.flag == LOWERBOUND) alpha = max(alpha, tte.value);
+                        if (tte.flag == UPPERBOUND) beta = min(beta, tte.value);
+                        if (alpha >= beta) return tte.value;
+                    }
+                }
+            }
+
+            if (depth <= 0 || b.isGameOver()) return evaluate(b, myColor);
+            int currColor = isMax ? myColor : (myColor == PLAYER1 ? PLAYER2 : PLAYER1);
+
+            vector<Move> moves = getValidMoves(b, currColor, depth);
+            if (moves.empty()) return evaluate(b, myColor);
+
+            if (hasTtMove) {
+                auto it = find(moves.begin(), moves.end(), ttBestMove);
+                if (it != moves.end() && it != moves.begin()) iter_swap(moves.begin(), it);
+            }
+
+            int best = isMax ? -INF : INF;
+            Move currentBestMove = moves[0];
+            bool firstMove = true;
+
+            for (auto& m : moves) {
+                Bitboard nextB = applyMove(b, m, currColor);
+                int val = 0;
+
+                if (firstMove) {
+                    val = pvsPonder(nextB, depth - 1, alpha, beta, !isMax, myColor, true);
+                    firstMove = false;
+                }
+                else {
+                    val = pvsPonder(nextB, depth - 1, alpha, alpha + 1, !isMax, myColor, true);
+                    if (val > alpha && val < beta) val = pvsPonder(nextB, depth - 1, alpha, beta, !isMax, myColor, true);
+                }
+
+                if (stopPonder) return 0;
+
+                if (isMax) { if (val > best) { best = val; currentBestMove = m; } alpha = max(alpha, best); }
+                else { if (val < best) { best = val; currentBestMove = m; } beta = min(beta, best); }
+
+                if (beta <= alpha) break;
+            }
+
+            {
+                lock_guard<mutex> lock(ttMutexes[lockIndex].m);
+                TTEntry& tte = TT_Cache[ttIndex];
+                if (depth > tte.depth) {
+                    tte.hash = b.hashKey; tte.depth = depth; tte.value = best; tte.bestMove = currentBestMove;
+                    if (best <= alphaOrig) tte.flag = UPPERBOUND; else if (best >= beta) tte.flag = LOWERBOUND; else tte.flag = EXACT;
+                }
+            }
+            return best;
+        }
+
+
+        static vector<Move> getValidMoves(const Bitboard& b, int color, int currentDepth) {
             vector<Move> moves;
             uint64_t my = (color == PLAYER1) ? b.p1 : b.p2;
             uint64_t opp = (color == PLAYER1) ? b.p2 : b.p1;
@@ -310,12 +356,20 @@ namespace Chiung {
                     int to = ctz64(clones);
                     int caps = popcount64(ADJ_MASK[to] & opp);
 
-                    int orderScore = (caps > 0) ? (3000 + caps * 100) : 1000;
-                    if ((1ULL << to) & corners) orderScore += 500;
-                    if ((1ULL << to) & danger) orderScore -= 300;
+                    int orderScore = 0;
+                    if (caps > 0) orderScore = 1000000 + caps * 10000;
+                    else {
+                        Move tempMove = { from, to, true, 0, 0 };
+                        if (currentDepth < 128) {
+                            if (tempMove == killerMoves[currentDepth][0]) orderScore += 90000;
+                            else if (tempMove == killerMoves[currentDepth][1]) orderScore += 80000;
+                        }
+                        orderScore += historyTable[color][from][to];
+                    }
 
-                    // 복제(Clone)시 단단한 진형 구축을 위한 정렬 보너스
-                    orderScore += 300;
+                    if ((1ULL << to) & corners) orderScore += 5000;
+                    if ((1ULL << to) & danger) orderScore -= 3000;
+                    orderScore += W_ORDER_BONUS;
 
                     moves.push_back({ from, to, true, caps, orderScore });
                     clones &= clones - 1;
@@ -331,9 +385,19 @@ namespace Chiung {
                     int to = ctz64(jumps);
                     int caps = popcount64(ADJ_MASK[to] & opp);
 
-                    int orderScore = (caps > 0) ? (2000 + caps * 100) : 0;
-                    if ((1ULL << to) & corners) orderScore += 500;
-                    if ((1ULL << to) & danger) orderScore -= 300;
+                    int orderScore = 0;
+                    if (caps > 0) orderScore = 1000000 + caps * 10000;
+                    else {
+                        Move tempMove = { from, to, false, 0, 0 };
+                        if (currentDepth < 128) {
+                            if (tempMove == killerMoves[currentDepth][0]) orderScore += 90000;
+                            else if (tempMove == killerMoves[currentDepth][1]) orderScore += 80000;
+                        }
+                        orderScore += historyTable[color][from][to];
+                    }
+
+                    if ((1ULL << to) & corners) orderScore += 5000;
+                    if ((1ULL << to) & danger) orderScore -= 3000;
 
                     moves.push_back({ from, to, false, caps, orderScore });
                     jumps &= jumps - 1;
@@ -367,10 +431,18 @@ namespace Chiung {
         }
 
         static Move getBestMoveTimeLimited(const Bitboard& b, int myColor, double timeLimitSeconds) {
-            searchCancelled = false;
-            totalGameNodes = 0; ttHits = 0; ttLookups = 0; highestReachedDepth = 0;
 
-            vector<Move> validMoves = getValidMoves(b, myColor);
+            stopPonder = true;
+            for (auto& w : ponderWorkers) { if (w.joinable()) w.join(); }
+            ponderWorkers.clear();
+
+            searchCancelled = false;
+            totalGameNodes = 0; highestReachedDepth = 0;
+
+            memset(historyTable, 0, sizeof(historyTable));
+            memset(killerMoves, 0, sizeof(killerMoves));
+
+            vector<Move> validMoves = getValidMoves(b, myColor, 0);
             if (validMoves.empty()) return { -1, -1, false, 0, 0 };
             if (validMoves.size() == 1) return validMoves[0];
 
@@ -384,66 +456,62 @@ namespace Chiung {
             for (int t = 0; t < numThreads; t++) {
                 workers.emplace_back([&, t, validMoves, myColor, b]() {
                     vector<Move> threadMoves = validMoves;
-
-                    if (t > 0) {
-                        mt19937 rng(12345 + t);
-                        shuffle(threadMoves.begin() + 1, threadMoves.end(), rng);
-                    }
+                    if (t > 0) { mt19937 rng(12345 + t); shuffle(threadMoves.begin() + 1, threadMoves.end(), rng); }
 
                     Move localBestMove = threadMoves[0];
                     int prevScore = 0;
 
                     for (int depth = 1; depth <= 100; depth++) {
 
-                        int alpha = -INF, beta = INF;
+                        int alphaOrig = -INF;
+                        int betaOrig = INF;
                         if (depth > 2) {
-                            alpha = prevScore - 400;
-                            beta = prevScore + 400;
+                            alphaOrig = prevScore - 50;
+                            betaOrig = prevScore + 50;
                         }
+                        int alpha = alphaOrig;
+                        int beta = betaOrig;
 
-                        int maxEval = -INF;
-                        Move depthBestMove = threadMoves[0];
+                        while (true) {
+                            int maxEval = -INF; Move depthBestMove = threadMoves[0];
+                            auto it = find(threadMoves.begin(), threadMoves.end(), localBestMove);
+                            if (it != threadMoves.end() && it != threadMoves.begin()) iter_swap(threadMoves.begin(), it);
 
-                        auto it = find(threadMoves.begin(), threadMoves.end(), localBestMove);
-                        if (it != threadMoves.end() && it != threadMoves.begin()) {
-                            iter_swap(threadMoves.begin(), it);
-                        }
+                            bool rootFirst = true;
+                            for (const Move& m : threadMoves) {
+                                Bitboard nextB = applyMove(b, m, myColor);
+                                int eval = 0;
 
-                        bool rootFirst = true;
-
-                        for (const Move& m : threadMoves) {
-                            Bitboard nextB = applyMove(b, m, myColor);
-                            int eval = 0;
-
-                            if (rootFirst) {
-                                eval = pvs(nextB, depth - 1, alpha, beta, false, myColor);
-                                rootFirst = false;
-                            }
-                            else {
-                                eval = pvs(nextB, depth - 1, alpha, alpha + 1, false, myColor);
-                                if (eval > alpha && eval < beta) {
-                                    eval = pvs(nextB, depth - 1, alpha, beta, false, myColor);
+                                if (rootFirst) { eval = pvs(nextB, depth - 1, alpha, beta, false, myColor, true); rootFirst = false; }
+                                else {
+                                    eval = pvs(nextB, depth - 1, alpha, alpha + 1, false, myColor, true);
+                                    if (eval > alpha && eval < beta) eval = pvs(nextB, depth - 1, alpha, beta, false, myColor, true);
                                 }
+
+                                if (searchCancelled) break;
+                                if (eval > maxEval) { maxEval = eval; depthBestMove = m; }
+                                alpha = max(alpha, eval);
                             }
 
                             if (searchCancelled) break;
 
-                            if (eval <= alpha || eval >= beta) {
-                                eval = pvs(nextB, depth - 1, -INF, INF, false, myColor);
+                            if (maxEval <= alphaOrig || maxEval >= betaOrig) {
+                                alphaOrig = -INF;
+                                betaOrig = INF;
+                                alpha = -INF;
+                                beta = INF;
+                                continue;
                             }
 
-                            if (eval > maxEval) { maxEval = eval; depthBestMove = m; }
-                            alpha = max(alpha, eval);
+                            localBestMove = depthBestMove; prevScore = maxEval;
+                            break;
                         }
 
                         if (searchCancelled) break;
-                        localBestMove = depthBestMove;
-                        prevScore = maxEval;
 
                         lock_guard<mutex> lock(bestMoveMutex);
                         if (depth > highestReachedDepth || (t == 0 && depth == highestReachedDepth)) {
-                            highestReachedDepth = depth;
-                            bestMoveOverall = localBestMove;
+                            highestReachedDepth = depth; bestMoveOverall = localBestMove;
                         }
                     }
                     });
@@ -453,11 +521,27 @@ namespace Chiung {
             while (duration<double>(high_resolution_clock::now() - start).count() < timeLimitSeconds) {
                 this_thread::sleep_for(milliseconds(5));
             }
-
             searchCancelled = true;
+            for (auto& w : workers) { if (w.joinable()) w.join(); }
 
-            for (auto& w : workers) {
-                if (w.joinable()) w.join();
+            Bitboard nextB = applyMove(b, bestMoveOverall, myColor);
+            int oppColor = (myColor == PLAYER1) ? PLAYER2 : PLAYER1;
+
+            int ttIndex = (int)(nextB.hashKey & (TT_SIZE - 1));
+            Move predictedOppMove = TT_Cache[ttIndex].bestMove;
+
+            if (predictedOppMove.to != -1 && !nextB.isGameOver()) {
+                Bitboard ponderBoard = applyMove(nextB, predictedOppMove, oppColor);
+                stopPonder = false;
+
+                for (int t = 0; t < numThreads; t++) {
+                    ponderWorkers.emplace_back([ponderBoard, myColor, t]() {
+                        for (int d = 1; d <= 25; d++) {
+                            if (stopPonder) break;
+                            pvsPonder(ponderBoard, d, -INF, INF, true, myColor, true);
+                        }
+                        });
+                }
             }
 
             return bestMoveOverall;
@@ -484,4 +568,4 @@ namespace Chiung {
             ZOBRIST_TURN = rng();
         }
     };
-} // end namespace Chiung
+}
