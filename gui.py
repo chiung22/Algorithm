@@ -110,7 +110,7 @@ class AtaxxGUI(tk.Tk):
         
         b_cnt = sum(row.count(1) for row in self.board)
         w_cnt = sum(row.count(2) for row in self.board)
-        turn_text = "치웅 AI 생각 중..." if self.current_turn == self.my_color else "상대방 입력 대기 중..."
+        turn_text = "🤖 치웅 AI 생각 중..." if self.current_turn == self.my_color else "👤 상대방 입력 대기 중..."
         self.info_label.config(text=f"흑(B): {b_cnt}  |  백(W): {w_cnt}\n{turn_text}")
         
         b_can_move = self.has_valid_moves(1)
