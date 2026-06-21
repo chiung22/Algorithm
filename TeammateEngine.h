@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstdint>
 #include <random>
-#include <bitset>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -47,6 +46,7 @@ namespace Teammate {
     const int INF = 1000000;
     const int TT_SIZE = 1048576;
     const int TT_LOCKS = 4096;
+    const int MAX_DEPTH = 128;
 
     inline static uint64_t ADJ_MASK[49];
     inline static uint64_t JUMP_MASK[49];
@@ -163,6 +163,9 @@ namespace Teammate {
         inline static int highestReachedDepth = 0;
         inline static mutex bestMoveMutex;
 
+        inline static int historyTable[49][49] = {};
+        inline static Move killerMoves[MAX_DEPTH][2];
+
         static int opponent(int color) {
             return color == PLAYER1 ? PLAYER2 : PLAYER1;
         }
@@ -232,12 +235,11 @@ namespace Teammate {
             int pieceScore = myCount - oppCount;
 
             if (emptyCount <= 17) {
-                return pieceScore * 12000;
+                return pieceScore * 12500;
             }
 
             int myMobility = 0;
             int oppMobility = 0;
-
             int myDensity = 0;
             int oppDensity = 0;
 
@@ -284,16 +286,58 @@ namespace Teammate {
 
             int progress = CELL_COUNT - emptyCount;
 
-            int pieceWeight = 55 + progress * 6;
-            int mobilityWeight = emptyCount * 3;
+            // 가중치 살짝 조정한 부분
+            int pieceWeight = 60 + progress * 7;
+            int mobilityWeight = emptyCount * 2;
 
             return
                 pieceScore * pieceWeight +
                 mobilityDiff * mobilityWeight +
-                densityDiff * 12 +
-                cornerDiff * 400 +
-                dangerDiff * 140 +
-                centerDiff * 8;
+                densityDiff * 10 +
+                cornerDiff * 430 +
+                dangerDiff * 165 +
+                centerDiff * 6;
+        }
+
+        static void saveKillerMove(const Move& m, int depth) {
+            if (m.to == -1) return;
+            if (depth < 0 || depth >= MAX_DEPTH) return;
+
+            if (!(m == killerMoves[depth][0])) {
+                killerMoves[depth][1] = killerMoves[depth][0];
+                killerMoves[depth][0] = m;
+            }
+        }
+
+        static void saveHistoryMove(const Move& m, int depth) {
+            if (m.from < 0 || m.to < 0) return;
+            if (depth <= 0) return;
+
+            historyTable[m.from][m.to] += depth * depth;
+
+            if (historyTable[m.from][m.to] > 1000000) {
+                historyTable[m.from][m.to] /= 2;
+            }
+        }
+
+        static void applyOrdering(vector<Move>& moves, int depth) {
+            if (depth < 0) return;
+            if (depth >= MAX_DEPTH) depth = MAX_DEPTH - 1;
+
+            for (auto& m : moves) {
+                if (m.from >= 0 && m.to >= 0) {
+                    m.orderScore += historyTable[m.from][m.to];
+                }
+
+                if (m == killerMoves[depth][0]) {
+                    m.orderScore += 900000;
+                }
+                else if (m == killerMoves[depth][1]) {
+                    m.orderScore += 600000;
+                }
+            }
+
+            sort(moves.begin(), moves.end());
         }
 
         static vector<Move> getValidMoves(const Bitboard& b, int color) {
@@ -324,9 +368,9 @@ namespace Teammate {
                         ? 3500 + caps * 180
                         : 1200;
 
-                    if (toBit & corners) orderScore += 900;
-                    if (toBit & center) orderScore += 120;
-                    if (toBit & danger) orderScore -= 450;
+                    if (toBit & corners) orderScore += 950;
+                    if (toBit & center) orderScore += 100;
+                    if (toBit & danger) orderScore -= 480;
 
                     orderScore += 80;
 
@@ -361,9 +405,9 @@ namespace Teammate {
                         ? 2300 + caps * 160
                         : 0;
 
-                    if (toBit & corners) orderScore += 950;
-                    if (toBit & center) orderScore += 80;
-                    if (toBit & danger) orderScore -= 350;
+                    if (toBit & corners) orderScore += 1000;
+                    if (toBit & center) orderScore += 70;
+                    if (toBit & danger) orderScore -= 380;
 
                     moves.push_back({
                         from,
@@ -485,6 +529,8 @@ namespace Teammate {
                 }
             }
 
+            applyOrdering(moves, depth);
+
             int best = isMax ? -INF : INF;
             Move currentBestMove = moves[0];
             bool firstMove = true;
@@ -505,6 +551,7 @@ namespace Teammate {
                         !isMax,
                         myColor
                     );
+
                     firstMove = false;
                 }
                 else {
@@ -576,7 +623,11 @@ namespace Teammate {
                     beta = min(beta, best);
                 }
 
-                if (beta <= alpha) break;
+                if (beta <= alpha) {
+                    saveKillerMove(move, depth);
+                    saveHistoryMove(move, depth);
+                    break;
+                }
             }
 
             {
@@ -640,6 +691,7 @@ namespace Teammate {
             double timeLimitSeconds
         ) {
             searchCancelled = false;
+
             totalNodes = 0;
             ttHits = 0;
             ttLookups = 0;
@@ -684,14 +736,24 @@ namespace Teammate {
                     }
 
                     Move localBestMove = threadMoves[0];
+                    int previousScore = 0;
 
                     for (int depth = 1; depth <= 100; depth++) {
                         if (searchCancelled) break;
 
-                        int maxEval = -INF;
-                        int alpha = -INF;
-                        int beta = INF;
+                        int aspiration = 250;
 
+                        int alpha =
+                            depth <= 2
+                            ? -INF
+                            : previousScore - aspiration;
+
+                        int beta =
+                            depth <= 2
+                            ? INF
+                            : previousScore + aspiration;
+
+                        int maxEval = -INF;
                         Move depthBestMove = localBestMove;
 
                         auto it = find(
@@ -704,69 +766,93 @@ namespace Teammate {
                             iter_swap(threadMoves.begin(), it);
                         }
 
-                        bool rootFirst = true;
+                        applyOrdering(threadMoves, depth);
 
-                        for (const Move& move : threadMoves) {
-                            if (searchCancelled) break;
+                        for (int attempt = 0; attempt < 2; attempt++) {
+                            maxEval = -INF;
+                            depthBestMove = localBestMove;
 
-                            Bitboard nextB = applyMove(b, move, myColor);
+                            int rootAlpha = alpha;
+                            int rootBeta = beta;
+                            bool rootFirst = true;
 
-                            int eval = 0;
+                            for (const Move& move : threadMoves) {
+                                if (searchCancelled) break;
 
-                            if (rootFirst) {
-                                eval = pvs(
-                                    nextB,
-                                    depth - 1,
-                                    alpha,
-                                    beta,
-                                    false,
-                                    myColor
-                                );
-                                rootFirst = false;
-                            }
-                            else {
-                                eval = pvs(
-                                    nextB,
-                                    depth - 1,
-                                    alpha,
-                                    alpha + 1,
-                                    false,
-                                    myColor
-                                );
+                                Bitboard nextB = applyMove(b, move, myColor);
 
-                                if (eval > alpha && eval < beta) {
+                                int eval = 0;
+
+                                if (rootFirst) {
                                     eval = pvs(
                                         nextB,
                                         depth - 1,
-                                        alpha,
-                                        beta,
+                                        rootAlpha,
+                                        rootBeta,
                                         false,
                                         myColor
                                     );
+
+                                    rootFirst = false;
                                 }
+                                else {
+                                    eval = pvs(
+                                        nextB,
+                                        depth - 1,
+                                        rootAlpha,
+                                        rootAlpha + 1,
+                                        false,
+                                        myColor
+                                    );
+
+                                    if (eval > rootAlpha && eval < rootBeta) {
+                                        eval = pvs(
+                                            nextB,
+                                            depth - 1,
+                                            rootAlpha,
+                                            rootBeta,
+                                            false,
+                                            myColor
+                                        );
+                                    }
+                                }
+
+                                if (searchCancelled) break;
+
+                                if (move.isClone) {
+                                    eval += 12;
+                                }
+
+                                if (eval > maxEval) {
+                                    maxEval = eval;
+                                    depthBestMove = move;
+                                }
+
+                                rootAlpha = max(rootAlpha, eval);
                             }
 
                             if (searchCancelled) break;
 
-                            if (move.isClone) {
-                                eval += 12;
+                            if (maxEval <= alpha || maxEval >= beta) {
+                                alpha = -INF;
+                                beta = INF;
+                                continue;
                             }
 
-                            if (eval > maxEval) {
-                                maxEval = eval;
-                                depthBestMove = move;
-                            }
-
-                            alpha = max(alpha, eval);
+                            break;
                         }
 
                         if (searchCancelled) break;
 
+                        previousScore = maxEval;
                         localBestMove = depthBestMove;
 
                         lock_guard<mutex> lock(bestMoveMutex);
 
-                        if (depth > highestReachedDepth || (t == 0 && depth == highestReachedDepth)) {
+                        if (
+                            depth > highestReachedDepth ||
+                            (t == 0 && depth == highestReachedDepth)
+                            ) {
                             highestReachedDepth = depth;
                             bestMoveOverall = localBestMove;
                         }
@@ -777,7 +863,7 @@ namespace Teammate {
             auto start = high_resolution_clock::now();
 
             while (duration<double>(high_resolution_clock::now() - start).count() < timeLimitSeconds) {
-                this_thread::sleep_for(milliseconds(5));
+                this_thread::sleep_for(milliseconds(1));
             }
 
             searchCancelled = true;
