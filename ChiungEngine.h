@@ -107,8 +107,6 @@ namespace Chiung {
         inline static mutex bestMoveMutex;
 
         inline static const int W_ORDER_BONUS = 300;
-        inline static const int W_DANGER_MULT = 80;
-        inline static const int W_CENTER_MAX = 20;
 
         static bool hasValidMoves(const Bitboard& b, int color) {
             uint64_t my = (color == PLAYER1) ? b.p1 : b.p2;
@@ -160,15 +158,25 @@ namespace Chiung {
             uint64_t danger = (1ULL << 1) | (1ULL << 5) | (1ULL << 7) | (1ULL << 8) | (1ULL << 12) | (1ULL << 13) |
                 (1ULL << 35) | (1ULL << 36) | (1ULL << 40) | (1ULL << 41) | (1ULL << 43) | (1ULL << 47);
             int dangerDiff = popcount64(opp & danger) - popcount64(my & danger);
+
             uint64_t center = 0x10E070000ULL;
             int centerDiff = popcount64(my & center) - popcount64(opp & center);
 
             double phase = (double)(49 - emptyCount) / 49.0;
-            int dynamicDangerPenalty = 20 + (int)(phase * W_DANGER_MULT);
-            int dynamicCenterBonus = (emptyCount > 38) ? W_CENTER_MAX : ((emptyCount > 15) ? 10 : 0);
+
+            // [고도화 1] 비대칭 전략 분리 (흑/백 가중치 완전 독립)
+            bool isBlack = (myColor == PLAYER1);
+
+            // 백(후공)일 때 위험 구역 페널티를 2배 이상 높여 철저한 우주방어 수행
+            int dynamicDangerPenalty = isBlack ? (20 + (int)(phase * 60)) : (40 + (int)(phase * 150));
+
+            // 흑(선공)일 때만 초반 중앙 장악에 가산점을 주어 공격력 극대화
+            int dynamicCenterBonus = isBlack ? ((emptyCount > 35) ? 30 : 10) : 0;
 
             int mWeight = (emptyCount * emptyCount) / 10;
-            int cWeight = 350 + (emptyCount <= 20 ? (20 - emptyCount) * 15 : 0);
+            // 백(후공)일 때 모서리(코너) 가중치를 압도적으로 높여 외곽을 선점하도록 유도
+            int cWeight = isBlack ? (350 + (emptyCount <= 20 ? (20 - emptyCount) * 15 : 0))
+                : (500 + (emptyCount <= 25 ? (25 - emptyCount) * 20 : 0));
             int pWeight = 50 + (49 - emptyCount) * 5;
 
             return pScore * pWeight + mDiff * mWeight + cDiff * cWeight + dangerDiff * dynamicDangerPenalty + centerDiff * dynamicCenterBonus;
@@ -207,7 +215,7 @@ namespace Chiung {
                 if (staticEval - margin >= beta) return staticEval - margin;
             }
 
-            if (isNullMoveAllowed && depth >= 3 && !hasValidMoves(b, currColor) == false) {
+            if (isNullMoveAllowed && depth >= 3 && hasValidMoves(b, currColor)) {
                 Bitboard nullBoard = b; nullBoard.hashKey ^= ZOBRIST_TURN;
                 int nullVal = pvs(nullBoard, depth - 1 - 2, alpha, beta, !isMax, myColor, false);
                 if (nullVal >= beta) return beta;
@@ -231,7 +239,13 @@ namespace Chiung {
                 int val = 0;
                 bool isCapture = m.infectCount > 0;
                 bool isKiller = (m == killerMoves[depth][0] || m == killerMoves[depth][1]);
-                int reduction = (depth >= 3 && movesSearched >= 3 && !isCapture && !isKiller && !m.isClone) ? ((movesSearched > 6) ? 2 : 1) : 0;
+
+                // [고도화 2] 정교해진 후기 이동 감소(LMR) 공식 적용
+                int reduction = 0;
+                if (depth >= 3 && movesSearched >= 3 && !isCapture && !isKiller && !m.isClone) {
+                    reduction = 1 + (movesSearched / 6) + (depth / 6);
+                    if (reduction >= depth) reduction = depth - 1; // 뎁스 초과 방지
+                }
 
                 if (firstMove) {
                     val = pvs(nextB, depth - 1, alpha, beta, !isMax, myColor, true);
@@ -336,7 +350,6 @@ namespace Chiung {
             }
             return best;
         }
-
 
         static vector<Move> getValidMoves(const Bitboard& b, int color, int currentDepth) {
             vector<Move> moves;
@@ -463,11 +476,13 @@ namespace Chiung {
 
                     for (int depth = 1; depth <= 100; depth++) {
 
+                        // [고도화 3] 단계별 Aspiration Window (타이트 창 탐색 확장) 적용
+                        int delta = 50;
                         int alphaOrig = -INF;
                         int betaOrig = INF;
                         if (depth > 2) {
-                            alphaOrig = prevScore - 50;
-                            betaOrig = prevScore + 50;
+                            alphaOrig = prevScore - delta;
+                            betaOrig = prevScore + delta;
                         }
                         int alpha = alphaOrig;
                         int beta = betaOrig;
@@ -495,11 +510,17 @@ namespace Chiung {
 
                             if (searchCancelled) break;
 
-                            if (maxEval <= alphaOrig || maxEval >= betaOrig) {
-                                alphaOrig = -INF;
-                                betaOrig = INF;
-                                alpha = -INF;
-                                beta = INF;
+                            // 점수가 창을 벗어났을 때 바로 포기(-INF, INF)하지 않고 점진적으로 창을 넓힘
+                            if (maxEval <= alphaOrig) {
+                                delta *= 3;
+                                alphaOrig = max(-INF, prevScore - delta);
+                                alpha = alphaOrig;
+                                continue;
+                            }
+                            else if (maxEval >= betaOrig) {
+                                delta *= 3;
+                                betaOrig = min(INF, prevScore + delta);
+                                beta = betaOrig;
                                 continue;
                             }
 
