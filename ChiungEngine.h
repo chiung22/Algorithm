@@ -135,7 +135,8 @@ namespace Chiung {
             if (!hasValidMoves(b, myColor)) return -INF;
 
             int pScore = myCount - oppCount;
-            if (emptyCount <= 17) return pScore * 100000;
+            // 극후반부에는 돌의 개수가 전부이므로 점수 증폭
+            if (emptyCount <= 14) return pScore * 100000;
 
             int myMobility = 0, oppMobility = 0;
             uint64_t temp = my;
@@ -152,34 +153,30 @@ namespace Chiung {
             }
 
             int mDiff = myMobility - oppMobility;
+            
+            // 코너 마스크 (가장 중요한 절대 방어 구역)
             uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
             int cDiff = popcount64(my & corners) - popcount64(opp & corners);
 
+            // 위험 구역 마스크 (코너와 인접하여 상대에게 코너를 내어줄 수 있는 X-C 구역)
             uint64_t danger = (1ULL << 1) | (1ULL << 5) | (1ULL << 7) | (1ULL << 8) | (1ULL << 12) | (1ULL << 13) |
                 (1ULL << 35) | (1ULL << 36) | (1ULL << 40) | (1ULL << 41) | (1ULL << 43) | (1ULL << 47);
+            // 내가 위험구역을 덜 차지할수록(+), 상대가 많이 차지할수록(+) 이득
             int dangerDiff = popcount64(opp & danger) - popcount64(my & danger);
+            
+            // 가장자리(Edge) 마스크 (코너 다음으로 안정적인 구역)
+            uint64_t edges = 0x1FC0000000000ULL | 0x7F | 0x1020408102040ULL | 0x2040810204080ULL;
+            edges &= ~(corners | danger); // 코너와 위험구역 제외
+            int edgeDiff = popcount64(my & edges) - popcount64(opp & edges);
 
-            uint64_t center = 0x10E070000ULL;
-            int centerDiff = popcount64(my & center) - popcount64(opp & center);
+            // [핵심 변경] 태완 엔진(코너 가중치 430)을 압살하기 위한 극단적 코너 지배 가중치
+            int cWeight = 3500 + (emptyCount * 20); // 코너 하나가 돌 30~50개 이상의 가치를 가짐
+            int dangerWeight = 1200;                // 코너 주변에 두는 행위 자체를 극도로 혐오하게 만듦
+            int edgeWeight = 200;                   // 외곽선 점유 보너스 추가
+            int mWeight = (emptyCount * 3);         // 초반 기동력 중시
+            int pWeight = 100 + (49 - emptyCount) * 6; // 중후반 돌 개수 가중치
 
-            double phase = (double)(49 - emptyCount) / 49.0;
-
-            // [고도화 1] 비대칭 전략 분리 (흑/백 가중치 완전 독립)
-            bool isBlack = (myColor == PLAYER1);
-
-            // 백(후공)일 때 위험 구역 페널티를 2배 이상 높여 철저한 우주방어 수행
-            int dynamicDangerPenalty = isBlack ? (20 + (int)(phase * 60)) : (40 + (int)(phase * 150));
-
-            // 흑(선공)일 때만 초반 중앙 장악에 가산점을 주어 공격력 극대화
-            int dynamicCenterBonus = isBlack ? ((emptyCount > 35) ? 30 : 10) : 0;
-
-            int mWeight = (emptyCount * emptyCount) / 10;
-            // 백(후공)일 때 모서리(코너) 가중치를 압도적으로 높여 외곽을 선점하도록 유도
-            int cWeight = isBlack ? (350 + (emptyCount <= 20 ? (20 - emptyCount) * 15 : 0))
-                : (500 + (emptyCount <= 25 ? (25 - emptyCount) * 20 : 0));
-            int pWeight = 50 + (49 - emptyCount) * 5;
-
-            return pScore * pWeight + mDiff * mWeight + cDiff * cWeight + dangerDiff * dynamicDangerPenalty + centerDiff * dynamicCenterBonus;
+            return pScore * pWeight + mDiff * mWeight + cDiff * cWeight + edgeDiff * edgeWeight + dangerDiff * dangerWeight;
         }
 
         static int pvs(const Bitboard& b, int depth, int alpha, int beta, bool isMax, int myColor, bool isNullMoveAllowed) {
@@ -211,7 +208,7 @@ namespace Chiung {
 
             if (!isMax && depth <= 3 && !hasTtMove) {
                 int staticEval = evaluate(b, myColor);
-                int margin = 120 * depth;
+                int margin = 150 * depth;
                 if (staticEval - margin >= beta) return staticEval - margin;
             }
 
@@ -239,12 +236,11 @@ namespace Chiung {
                 int val = 0;
                 bool isCapture = m.infectCount > 0;
                 bool isKiller = (m == killerMoves[depth][0] || m == killerMoves[depth][1]);
-
-                // [고도화 2] 정교해진 후기 이동 감소(LMR) 공식 적용
+                
                 int reduction = 0;
                 if (depth >= 3 && movesSearched >= 3 && !isCapture && !isKiller && !m.isClone) {
                     reduction = 1 + (movesSearched / 6) + (depth / 6);
-                    if (reduction >= depth) reduction = depth - 1; // 뎁스 초과 방지
+                    if (reduction >= depth) reduction = depth - 1;
                 }
 
                 if (firstMove) {
@@ -380,8 +376,9 @@ namespace Chiung {
                         orderScore += historyTable[color][from][to];
                     }
 
-                    if ((1ULL << to) & corners) orderScore += 5000;
-                    if ((1ULL << to) & danger) orderScore -= 3000;
+                    // [핵심 변경] Move Ordering 최우선 탐색으로 코너 선점 절대화
+                    if ((1ULL << to) & corners) orderScore += 500000;
+                    if ((1ULL << to) & danger) orderScore -= 100000;
                     orderScore += W_ORDER_BONUS;
 
                     moves.push_back({ from, to, true, caps, orderScore });
@@ -409,8 +406,8 @@ namespace Chiung {
                         orderScore += historyTable[color][from][to];
                     }
 
-                    if ((1ULL << to) & corners) orderScore += 5000;
-                    if ((1ULL << to) & danger) orderScore -= 3000;
+                    if ((1ULL << to) & corners) orderScore += 500000;
+                    if ((1ULL << to) & danger) orderScore -= 100000;
 
                     moves.push_back({ from, to, false, caps, orderScore });
                     jumps &= jumps - 1;
@@ -476,8 +473,7 @@ namespace Chiung {
 
                     for (int depth = 1; depth <= 100; depth++) {
 
-                        // [고도화 3] 단계별 Aspiration Window (타이트 창 탐색 확장) 적용
-                        int delta = 50;
+                        int delta = 50; 
                         int alphaOrig = -INF;
                         int betaOrig = INF;
                         if (depth > 2) {
@@ -510,7 +506,6 @@ namespace Chiung {
 
                             if (searchCancelled) break;
 
-                            // 점수가 창을 벗어났을 때 바로 포기(-INF, INF)하지 않고 점진적으로 창을 넓힘
                             if (maxEval <= alphaOrig) {
                                 delta *= 3;
                                 alphaOrig = max(-INF, prevScore - delta);
