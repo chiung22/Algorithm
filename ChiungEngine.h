@@ -20,9 +20,14 @@ using namespace std::chrono;
 
 namespace Chiung {
 
+    // [수정] 32비트(x86)와 64비트(x64) 환경 모두에서 작동하도록 분기 처리
     inline int popcount64(uint64_t x) {
 #ifdef _MSC_VER
+#ifdef _WIN64
         return (int)__popcnt64(x);
+#else
+        return (int)__popcnt((unsigned int)(x & 0xFFFFFFFF)) + (int)__popcnt((unsigned int)(x >> 32));
+#endif
 #else
         return (int)__builtin_popcountll(x);
 #endif
@@ -31,8 +36,13 @@ namespace Chiung {
     inline int ctz64(uint64_t x) {
 #ifdef _MSC_VER
         unsigned long index;
-        _BitScanForward64(&index, x);
-        return (int)index;
+#ifdef _WIN64
+        if (_BitScanForward64(&index, x)) return (int)index;
+#else
+        if (_BitScanForward(&index, (unsigned long)(x & 0xFFFFFFFF))) return (int)index;
+        if (_BitScanForward(&index, (unsigned long)(x >> 32))) return (int)index + 32;
+#endif
+        return 64;
 #else
         return (int)__builtin_ctzll(x);
 #endif
@@ -49,7 +59,6 @@ namespace Chiung {
     const int TT_SIZE = 1048576;
     const int TT_LOCKS = 4096;
 
-    // [수정] C++14 호환을 위해 inline 제거
     static uint64_t ADJ_MASK[49];
     static uint64_t JUMP_MASK[49];
     static uint64_t ZOBRIST_TABLE[49][2];
@@ -80,6 +89,12 @@ namespace Chiung {
     static atomic<bool> stopPonder{ false };
     static vector<thread> ponderWorkers;
 
+    // [수정] 클래스 내부에 있던 정적 변수들을 네임스페이스 전역으로 완전히 분리하여 참조 오류(C2065) 해결
+    static atomic<long long> totalGameNodes{ 0 };
+    static Move bestMoveOverall;
+    static int highestReachedDepth = 0;
+    static mutex bestMoveMutex;
+
     struct Bitboard {
         uint64_t p1 = 0, p2 = 0, hashKey = 0;
         void init() {
@@ -102,12 +117,6 @@ namespace Chiung {
 
     class AtaxxEngine {
     public:
-        // [수정] 클래스 정적 변수는 내부에서 선언만 하고 초기화는 외부로 뺌
-        static atomic<long long> totalGameNodes;
-        static Move bestMoveOverall;
-        static int highestReachedDepth;
-        static mutex bestMoveMutex;
-
         static const int W_ORDER_BONUS = 300;
 
         static bool hasValidMoves(const Bitboard& b, int color) {
@@ -579,11 +588,4 @@ namespace Chiung {
             ZOBRIST_TURN = rng();
         }
     };
-
-    // [수정] 클래스 외부에서 정적 변수 정의 (C++14 문법)
-    atomic<long long> AtaxxEngine::totalGameNodes{ 0 };
-    Move AtaxxEngine::bestMoveOverall;
-    int AtaxxEngine::highestReachedDepth = 0;
-    mutex AtaxxEngine::bestMoveMutex;
-
 }
