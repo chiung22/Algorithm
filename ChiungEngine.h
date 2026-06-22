@@ -49,10 +49,11 @@ namespace Chiung {
     const int TT_SIZE = 1048576;
     const int TT_LOCKS = 4096;
 
-    inline static uint64_t ADJ_MASK[49];
-    inline static uint64_t JUMP_MASK[49];
-    inline static uint64_t ZOBRIST_TABLE[49][2];
-    inline static uint64_t ZOBRIST_TURN;
+    // [수정] C++14 호환을 위해 inline 제거
+    static uint64_t ADJ_MASK[49];
+    static uint64_t JUMP_MASK[49];
+    static uint64_t ZOBRIST_TABLE[49][2];
+    static uint64_t ZOBRIST_TURN;
 
     enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 
@@ -68,16 +69,16 @@ namespace Chiung {
             : hash(h), depth(d), value(v), flag(f), bestMove(m) {}
     };
 
-    inline static vector<TTEntry> TT_Cache(TT_SIZE);
+    static vector<TTEntry> TT_Cache(TT_SIZE);
     struct MutexWrapper { std::mutex m; };
-    inline static MutexWrapper ttMutexes[TT_LOCKS];
+    static MutexWrapper ttMutexes[TT_LOCKS];
 
-    inline static atomic<bool> searchCancelled{ false };
-    inline static int historyTable[3][49][49];
-    inline static Move killerMoves[128][2];
+    static atomic<bool> searchCancelled{ false };
+    static int historyTable[3][49][49];
+    static Move killerMoves[128][2];
 
-    inline static atomic<bool> stopPonder{ false };
-    inline static vector<thread> ponderWorkers;
+    static atomic<bool> stopPonder{ false };
+    static vector<thread> ponderWorkers;
 
     struct Bitboard {
         uint64_t p1 = 0, p2 = 0, hashKey = 0;
@@ -101,12 +102,13 @@ namespace Chiung {
 
     class AtaxxEngine {
     public:
-        inline static atomic<long long> totalGameNodes{ 0 };
-        inline static Move bestMoveOverall;
-        inline static int highestReachedDepth = 0;
-        inline static mutex bestMoveMutex;
+        // [수정] 클래스 정적 변수는 내부에서 선언만 하고 초기화는 외부로 뺌
+        static atomic<long long> totalGameNodes;
+        static Move bestMoveOverall;
+        static int highestReachedDepth;
+        static mutex bestMoveMutex;
 
-        inline static const int W_ORDER_BONUS = 300;
+        static const int W_ORDER_BONUS = 300;
 
         static bool hasValidMoves(const Bitboard& b, int color) {
             uint64_t my = (color == PLAYER1) ? b.p1 : b.p2;
@@ -135,7 +137,6 @@ namespace Chiung {
             if (!hasValidMoves(b, myColor)) return -INF;
 
             int pScore = myCount - oppCount;
-            // 극후반부에는 돌의 개수가 전부이므로 점수 증폭
             if (emptyCount <= 14) return pScore * 100000;
 
             int myMobility = 0, oppMobility = 0;
@@ -154,27 +155,22 @@ namespace Chiung {
 
             int mDiff = myMobility - oppMobility;
             
-            // 코너 마스크 (가장 중요한 절대 방어 구역)
             uint64_t corners = (1ULL << 0) | (1ULL << 6) | (1ULL << 42) | (1ULL << 48);
             int cDiff = popcount64(my & corners) - popcount64(opp & corners);
 
-            // 위험 구역 마스크 (코너와 인접하여 상대에게 코너를 내어줄 수 있는 X-C 구역)
             uint64_t danger = (1ULL << 1) | (1ULL << 5) | (1ULL << 7) | (1ULL << 8) | (1ULL << 12) | (1ULL << 13) |
                 (1ULL << 35) | (1ULL << 36) | (1ULL << 40) | (1ULL << 41) | (1ULL << 43) | (1ULL << 47);
-            // 내가 위험구역을 덜 차지할수록(+), 상대가 많이 차지할수록(+) 이득
             int dangerDiff = popcount64(opp & danger) - popcount64(my & danger);
             
-            // 가장자리(Edge) 마스크 (코너 다음으로 안정적인 구역)
             uint64_t edges = 0x1FC0000000000ULL | 0x7F | 0x1020408102040ULL | 0x2040810204080ULL;
-            edges &= ~(corners | danger); // 코너와 위험구역 제외
+            edges &= ~(corners | danger);
             int edgeDiff = popcount64(my & edges) - popcount64(opp & edges);
 
-            // [핵심 변경] 태완 엔진(코너 가중치 430)을 압살하기 위한 극단적 코너 지배 가중치
-            int cWeight = 3500 + (emptyCount * 20); // 코너 하나가 돌 30~50개 이상의 가치를 가짐
-            int dangerWeight = 1200;                // 코너 주변에 두는 행위 자체를 극도로 혐오하게 만듦
-            int edgeWeight = 200;                   // 외곽선 점유 보너스 추가
-            int mWeight = (emptyCount * 3);         // 초반 기동력 중시
-            int pWeight = 100 + (49 - emptyCount) * 6; // 중후반 돌 개수 가중치
+            int cWeight = 3500 + (emptyCount * 20);
+            int dangerWeight = 1200;
+            int edgeWeight = 200;
+            int mWeight = (emptyCount * 3);
+            int pWeight = 100 + (49 - emptyCount) * 6;
 
             return pScore * pWeight + mDiff * mWeight + cDiff * cWeight + edgeDiff * edgeWeight + dangerDiff * dangerWeight;
         }
@@ -376,7 +372,6 @@ namespace Chiung {
                         orderScore += historyTable[color][from][to];
                     }
 
-                    // [핵심 변경] Move Ordering 최우선 탐색으로 코너 선점 절대화
                     if ((1ULL << to) & corners) orderScore += 500000;
                     if ((1ULL << to) & danger) orderScore -= 100000;
                     orderScore += W_ORDER_BONUS;
@@ -584,4 +579,11 @@ namespace Chiung {
             ZOBRIST_TURN = rng();
         }
     };
+
+    // [수정] 클래스 외부에서 정적 변수 정의 (C++14 문법)
+    atomic<long long> AtaxxEngine::totalGameNodes{ 0 };
+    Move AtaxxEngine::bestMoveOverall;
+    int AtaxxEngine::highestReachedDepth = 0;
+    mutex AtaxxEngine::bestMoveMutex;
+
 }
